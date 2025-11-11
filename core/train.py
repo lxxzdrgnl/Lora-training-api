@@ -293,10 +293,17 @@ def train_lora(
         avg_loss = epoch_loss / len(image_caption_pairs)
         print(f"Epoch {epoch+1} completed - Average Loss: {avg_loss:.4f}")
 
-    # 모델 저장
-    print(f"\nSaving model to: {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-    unet.save_pretrained(output_dir)
+        # 50 에포크마다 체크포인트 저장
+        if (epoch + 1) % 50 == 0 or (epoch + 1) == config.num_epochs:
+            checkpoint_dir = os.path.join(output_dir, f"checkpoint-{epoch + 1}")
+            print(f"\nSaving checkpoint to: {checkpoint_dir}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            unet.save_pretrained(checkpoint_dir)
+
+    # 최종 모델 저장 메시지 (이제 체크포인트로 저장되므로 주석 처리 또는 수정)
+    # print(f"\nSaving model to: {output_dir}")
+    # os.makedirs(output_dir, exist_ok=True)
+    # unet.save_pretrained(output_dir)
 
     # 통계 출력
     print(f"\nTraining Statistics:")

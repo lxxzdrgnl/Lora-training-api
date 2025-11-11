@@ -17,6 +17,22 @@
 - **LoRA 파인튜닝**: Stable Diffusion 모델 경량화 학습
 - **자동 추론**: 학습된 모델로 이미지 생성
 
+## 예시
+
+### 입력 데이터셋
+만화 스크린샷 20장으로 학습 (체인소맨 - 레제)
+
+![Dataset Example](example/dataset.png)
+
+### 생성 결과
+학습된 모델로 생성한 이미지
+
+![Generated Result](example/reze.png)
+
+**프롬프트:** `sks, a manga girl with black hair and a white shirt, get a flower, mangastyle, monochrome,black and white, grayscale`
+
+**설정:** `200 epochs`, `learning_rate=3e-5`, `lora_r=32`
+
 ## 설치
 
 ```bash
@@ -275,6 +291,9 @@ lora/
 │   └── train.py          # 학습 로직
 ├── dataset/              # 원본 데이터셋 (만화 스크린샷)
 ├── dataset_clean/        # 전처리된 데이터셋 (자동 생성)
+├── example/              # 예시 이미지 (데이터셋 샘플, 생성 결과)
+│   ├── dataset.png       # 원본 데이터셋 예시
+│   └── reze.png          # 생성 결과 예시
 ├── generate.py           # 이미지 생성을 위한 메인 스크립트
 ├── main.py               # FastAPI 애플리케이션 엔트리포인트
 ├── outputs/              # 생성된 이미지

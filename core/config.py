@@ -23,8 +23,8 @@ class TrainingConfig:
     target_modules: list = None  # ["to_q", "to_v", "to_k", "to_out.0"]
 
     # 학습
-    num_epochs: int = 150  # 충분한 학습
-    learning_rate: float = 1e-4  # 학습률
+    num_epochs: int = 250
+    learning_rate: float = 2e-5  # 학습률
     weight_decay: float = 1e-2
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
@@ -54,9 +54,9 @@ class InferenceConfig:
     # 생성 옵션
     prompt: str = "portrait, high quality"  # sks가 자동으로 추가됨
     negative_prompt: str = "low quality, blurry, ugly, distorted, deformed"
-    num_images: int = 1
+    num_images: int = 3
     steps: int = 40
-    guidance_scale: float = 7.5
+    guidance_scale: float = 6.5
     seed: int = None
 
     # 출력

@@ -47,14 +47,14 @@ def load_pipeline(model_id: str, lora_path: str, device: str):
 
 
 def generate_images(
-    lora_path: str,
+    lora_path: str = None,
     prompt: str = None,
     negative_prompt: str = None,
-    num_images: int = 1,
-    steps: int = 25,
-    guidance_scale: float = 7.5,
+    num_images: int = None,
+    steps: int = None,
+    guidance_scale: float = None,
     seed: int = None,
-    output_dir: str = "outputs",
+    output_dir: str = None,
     config: InferenceConfig = None
 ):
     """
@@ -77,19 +77,23 @@ def generate_images(
     if config is None:
         config = InferenceConfig()
 
-    # 설정 오버라이드
-    if prompt:
+    # 설정 오버라이드 (None이 아닐 때만)
+    if prompt is not None:
         config.prompt = prompt
-    if negative_prompt:
+    if negative_prompt is not None:
         config.negative_prompt = negative_prompt
-    if lora_path:
+    if lora_path is not None:
         config.lora_path = lora_path
-
-    config.num_images = num_images
-    config.steps = steps
-    config.guidance_scale = guidance_scale
-    config.seed = seed
-    config.output_dir = output_dir
+    if num_images is not None:
+        config.num_images = num_images
+    if steps is not None:
+        config.steps = steps
+    if guidance_scale is not None:
+        config.guidance_scale = guidance_scale
+    if seed is not None:
+        config.seed = seed
+    if output_dir is not None:
+        config.output_dir = output_dir
 
     # 파이프라인 로드
     pipe = load_pipeline(config.model_id, config.lora_path, config.device)
@@ -101,6 +105,7 @@ def generate_images(
         full_prompt = config.prompt
 
     print("="*60)
+    print(f"DEBUG: config.num_images = {config.num_images}")
     print(f"Generating {config.num_images} image(s)")
     print(f"Prompt: {full_prompt}")
     print(f"Negative: {config.negative_prompt}")
@@ -161,48 +166,48 @@ def main():
     parser.add_argument(
         "--lora_path",
         type=str,
-        default="my_lora_model",
-        help="LoRA 모델 경로"
+        default=None,
+        help="LoRA 모델 경로 (기본값: config 설정)"
     )
     parser.add_argument(
         "--model_id",
         type=str,
-        default="xyn-ai/anything-v4.0",
-        help="베이스 Stable Diffusion 모델"
+        default=None,
+        help="베이스 Stable Diffusion 모델 (기본값: config 설정)"
     )
 
     # 프롬프트 설정
     parser.add_argument(
         "--prompt",
         type=str,
-        default="black hair, long hair, black and white manga style, monochrome illustration",
-        help="이미지 생성 프롬프트"
+        default=None,
+        help="이미지 생성 프롬프트 (기본값: config 설정)"
     )
     parser.add_argument(
         "--negative_prompt",
         type=str,
-        default="color, colorful, low quality, blurry, ugly, distorted",
-        help="네거티브 프롬프트"
+        default=None,
+        help="네거티브 프롬프트 (기본값: config 설정)"
     )
 
     # 생성 옵션
     parser.add_argument(
         "--num_images",
         type=int,
-        default=1,
-        help="생성할 이미지 개수"
+        default=None,
+        help="생성할 이미지 개수 (기본값: config 설정)"
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=25,
-        help="Inference steps (20-50 권장)"
+        default=None,
+        help="Inference steps (기본값: config 설정)"
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=7.5,
-        help="CFG scale (7-10 권장)"
+        default=None,
+        help="CFG scale (기본값: config 설정)"
     )
     parser.add_argument(
         "--seed",
@@ -215,30 +220,41 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="outputs",
-        help="생성된 이미지 저장 폴더"
+        default=None,
+        help="생성된 이미지 저장 폴더 (기본값: config 설정)"
     )
 
     args = parser.parse_args()
 
+    # 이미지 생성 (config 기본값 사용 후 CLI 인자로 오버라이드)
+    config = InferenceConfig()
+
+    # CLI 인자가 지정된 경우만 오버라이드
+    if args.model_id is not None:
+        config.model_id = args.model_id
+    if args.lora_path is not None:
+        config.lora_path = args.lora_path
+
+    if args.prompt is not None:
+        config.prompt = args.prompt
+    if args.negative_prompt is not None:
+        config.negative_prompt = args.negative_prompt
+    if args.num_images is not None:
+        config.num_images = args.num_images
+    if args.steps is not None:
+        config.steps = args.steps
+    if args.guidance_scale is not None:
+        config.guidance_scale = args.guidance_scale
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.output_dir is not None:
+        config.output_dir = args.output_dir
+
     # LoRA 모델 존재 확인
-    if not os.path.exists(args.lora_path):
-        print(f"❌ Error: LoRA model not found at {args.lora_path}")
+    if not os.path.exists(config.lora_path):
+        print(f"❌ Error: LoRA model not found at {config.lora_path}")
         print(f"Please train the model first: python training.py")
         return
-
-    # 이미지 생성
-    config = InferenceConfig(
-        model_id=args.model_id,
-        lora_path=args.lora_path,
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        num_images=args.num_images,
-        steps=args.steps,
-        guidance_scale=args.guidance_scale,
-        seed=args.seed,
-        output_dir=args.output_dir
-    )
 
     generate_images(
         lora_path=config.lora_path,

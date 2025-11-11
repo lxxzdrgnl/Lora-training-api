@@ -54,6 +54,12 @@ training_loss.png
 *.webp
 dataset_captions.json
 
+# 예시 이미지는 Git에 포함
+!example/*.png
+!example/*.jpg
+!example/*.jpeg
+!example/*.webp
+
 # 데이터셋 (용량이 큰 경우 주석 해제)
 # dataset/
 
