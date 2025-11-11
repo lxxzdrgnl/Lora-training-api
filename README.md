@@ -1,11 +1,18 @@
 # LoRA Character Training Pipeline
 
-만화/웹툰 캐릭터를 학습시키는 자동화된 LoRA 파인튜닝 파이프라인
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
+![Status](https://img.shields.io/badge/Status-Active-success?style=flat-square)
+
+만화/웹툰 캐릭터를 학습시키는 **자동화된 LoRA 파인튜닝 파이프라인**
+
+> 만화 스크린샷만 넣으면 자동으로 텍스트 제거, 캐릭터 크롭, LoRA 학습까지 원클릭!
 
 ## 주요 기능
 
 - **자동 데이터셋 전처리**: 만화 스크린샷에서 캐릭터 자동 크롭
-- **텍스트/말풍선 제거**: OCR 기반 텍스트 영역 회피
+- **텍스트/말풍선 제거**: OCR 기반 텍스트 감지 + Inpainting 제거
 - **캐릭터 전신 감지**: 배경 제거 기반 전신 크롭
 - **LoRA 파인튜닝**: Stable Diffusion 모델 경량화 학습
 - **자동 추론**: 학습된 모델로 이미지 생성
@@ -128,10 +135,11 @@ lora/
 
 ### 자동 처리 단계
 
-1. **캐릭터 감지**: 배경 제거 (rembg)로 캐릭터 영역 탐지
-2. **텍스트 감지**: OCR (EasyOCR)로 말풍선/텍스트 위치 파악
-3. **스마트 크롭**: 텍스트 영역을 피해서 캐릭터 중심 크롭
-4. **리사이즈**: 512x512 정사각형 (종횡비 유지, 패딩 추가)
+1. **텍스트 감지**: OCR (EasyOCR)로 말풍선/텍스트 위치 파악
+2. **텍스트 제거**: Inpainting으로 텍스트 영역 자동 제거
+3. **캐릭터 감지**: 배경 제거 (rembg)로 캐릭터 영역 탐지
+4. **스마트 크롭**: 캐릭터 중심으로 bbox 확장 (전신 포함)
+5. **리사이즈**: 512x512 정사각형 (종횡비 유지, 패딩 추가)
 
 
 ## 학습 팁
@@ -153,29 +161,67 @@ lora/
 - `lora_r = 16-32`
 - `learning_rate = 1e-5`
 
-### 모델 버전 관리
+**과적합 증상:**
+- Loss가 계속 감소하지만 생성 이미지 품질이 떨어짐
+- 해결: Epoch 수 줄이기, Learning rate 낮추기
 
-```bash
-# 버전별 저장
-my_lora_model_v1/
-my_lora_model_v2/
-my_lora_model_epoch50/
-my_lora_model_epoch100/
-```
+**과소적합 증상:**
+- 캐릭터가 원본과 많이 다름
+- 해결: Epoch 수 늘리기, LoRA rank 높이기
+
 
 ## 기술 스택
 
-- **Base Model**: Stable Diffusion (Anything v4.0)
-- **Fine-tuning**: LoRA (PEFT)
-- **Preprocessing**:
-  - rembg (배경 제거)
-  - EasyOCR (텍스트 감지)
-  - OpenCV (이미지 처리)
-- **Framework**: PyTorch, Diffusers, Transformers
+### Deep Learning & AI
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![Hugging Face](https://img.shields.io/badge/🤗_Diffusers-Latest-FFD21E?style=for-the-badge)
+![Transformers](https://img.shields.io/badge/Transformers-Latest-FF6F00?style=for-the-badge)
+
+### Model & Fine-tuning
+![Stable Diffusion](https://img.shields.io/badge/Stable_Diffusion-Anything_v4.0-9C27B0?style=for-the-badge)
+![LoRA](https://img.shields.io/badge/LoRA-PEFT-00C853?style=for-the-badge)
+
+### Preprocessing
+![OpenCV](https://img.shields.io/badge/OpenCV-Latest-5C3EE8?style=for-the-badge&logo=opencv&logoColor=white)
+![EasyOCR](https://img.shields.io/badge/EasyOCR-Text_Detection-FF6B6B?style=for-the-badge)
+![rembg](https://img.shields.io/badge/rembg-Background_Removal-00D9FF?style=for-the-badge)
+
+## 트러블슈팅
+
+### Q: 전처리가 실패함 (캐릭터 감지 안됨)
+**A:** 배경이 너무 복잡하거나 캐릭터가 작은 경우 발생합니다.
+- 해결: 수동으로 크롭하거나 다른 이미지를 사용하세요.
+
+### Q: 생성된 이미지가 깨져있거나 노이즈가 많음
+**A:** 데이터셋에 텍스트/말풍선이 제대로 제거되지 않았을 수 있습니다.
+- 해결: `dataset_clean/` 폴더를 확인해 전처리가 제대로 됐는지 체크하세요.
+- 전처리를 다시 실행하려면: `rm -rf dataset_clean && python train.py`
+
+### Q: CUDA out of memory 에러
+**A:** GPU 메모리 부족입니다.
+```python
+# train.py Config 수정
+gradient_accumulation_steps = 2  # 1 → 2로 변경
+# 또는 이미지 크기 축소
+image_size = 512  # → 384
+```
+
+### Q: 학습이 너무 느림
+**A:** GPU 사용을 확인하세요:
+```bash
+nvidia-smi  # GPU 사용 확인
+```
 
 ## 라이센스
+
 MIT License
 
 ## 참고 자료
+
+- [LoRA 논문](https://arxiv.org/abs/2106.09685)
 - [Diffusers 문서](https://huggingface.co/docs/diffusers)
+- [PEFT 라이브러리](https://github.com/huggingface/peft)
 - [Anything v4.0 모델](https://huggingface.co/xyn-ai/anything-v4.0)
+- [EasyOCR](https://github.com/JaidedAI/EasyOCR)
+- [rembg](https://github.com/danielgatis/rembg)

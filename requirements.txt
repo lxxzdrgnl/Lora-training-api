@@ -1,17 +1,25 @@
+# Deep Learning
 torch
 torchvision
 diffusers
 transformers
 accelerate
+peft
+
+# Storage
 safetensors
 bitsandbytes
+
+# Image Processing
 Pillow
-datasets
-peft
-numpy
-tqdm
-matplotlib
 opencv-python
-easyocr
 rembg
 onnxruntime
+
+# Text Processing
+easyocr
+
+# Data & Utils
+numpy
+tqdm
+datasets

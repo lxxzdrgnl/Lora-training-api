@@ -1,6 +1,5 @@
 """
-LoRA 모델 추론 스크립트
-학습된 LoRA 가중치로 이미지 생성
+LoRA 모델 추론 모듈
 """
 
 import torch
@@ -11,9 +10,21 @@ from datetime import datetime
 import os
 from pathlib import Path
 
+from .config import InferenceConfig
 
-def load_pipeline(model_id, lora_path, device):
-    """Stable Diffusion 파이프라인 + LoRA 로드"""
+
+def load_pipeline(model_id: str, lora_path: str, device: str):
+    """
+    Stable Diffusion 파이프라인 + LoRA 로드
+
+    Args:
+        model_id: 베이스 모델 ID
+        lora_path: LoRA 모델 경로
+        device: 디바이스 (cuda/cpu)
+
+    Returns:
+        StableDiffusionPipeline: 로드된 파이프라인
+    """
     print(f"\nLoading base model: {model_id}")
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id,
@@ -35,43 +46,89 @@ def load_pipeline(model_id, lora_path, device):
     return pipe
 
 
-def generate_images(pipe, args, device):
-    """이미지 생성"""
+def generate_images(
+    lora_path: str,
+    prompt: str = None,
+    negative_prompt: str = None,
+    num_images: int = 1,
+    steps: int = 25,
+    guidance_scale: float = 7.5,
+    seed: int = None,
+    output_dir: str = "outputs",
+    config: InferenceConfig = None
+):
+    """
+    이미지 생성 함수 (Modal API용)
+
+    Args:
+        lora_path: LoRA 모델 경로
+        prompt: 프롬프트
+        negative_prompt: 네거티브 프롬프트
+        num_images: 생성할 이미지 수
+        steps: 추론 스텝
+        guidance_scale: CFG scale
+        seed: 랜덤 시드
+        output_dir: 출력 폴더
+        config: 추론 설정 (None이면 기본값 사용)
+
+    Returns:
+        list: 생성된 이미지 경로 리스트
+    """
+    if config is None:
+        config = InferenceConfig()
+
+    # 설정 오버라이드
+    if prompt:
+        config.prompt = prompt
+    if negative_prompt:
+        config.negative_prompt = negative_prompt
+    if lora_path:
+        config.lora_path = lora_path
+
+    config.num_images = num_images
+    config.steps = steps
+    config.guidance_scale = guidance_scale
+    config.seed = seed
+    config.output_dir = output_dir
+
+    # 파이프라인 로드
+    pipe = load_pipeline(config.model_id, config.lora_path, config.device)
+
     # Trigger word 자동 추가
-    if not args.prompt.startswith("sks"):
-        full_prompt = f"sks girl, {args.prompt}"
+    if not config.prompt.startswith(config.trigger_word):
+        full_prompt = f"{config.trigger_word}, {config.prompt}"
     else:
-        full_prompt = args.prompt
+        full_prompt = config.prompt
 
     print("="*60)
-    print(f"Generating {args.num_images} image(s)")
+    print(f"Generating {config.num_images} image(s)")
     print(f"Prompt: {full_prompt}")
-    print(f"Negative: {args.negative_prompt}")
-    print(f"Steps: {args.steps} | CFG Scale: {args.guidance_scale}")
-    if args.seed is not None:
-        print(f"Seed: {args.seed}")
+    print(f"Negative: {config.negative_prompt}")
+    print(f"Steps: {config.steps} | CFG Scale: {config.guidance_scale}")
+    if config.seed is not None:
+        print(f"Seed: {config.seed}")
     print("="*60)
 
     # 시드 설정
     generator = None
-    if args.seed is not None:
-        generator = torch.Generator(device=device).manual_seed(args.seed)
+    if config.seed is not None:
+        generator = torch.Generator(device=config.device).manual_seed(config.seed)
 
     # 출력 폴더 생성
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(exist_ok=True)
 
     # 이미지 생성
     generated_files = []
-    for i in range(args.num_images):
-        print(f"\n[{i+1}/{args.num_images}] Generating...")
+    for i in range(config.num_images):
+        print(f"\n[{i+1}/{config.num_images}] Generating...")
 
         with torch.no_grad():
             image = pipe(
                 prompt=full_prompt,
-                negative_prompt=args.negative_prompt,
-                num_inference_steps=args.steps,
-                guidance_scale=args.guidance_scale,
+                negative_prompt=config.negative_prompt,
+                num_inference_steps=config.steps,
+                guidance_scale=config.guidance_scale,
                 generator=generator
             ).images[0]
 
@@ -82,18 +139,19 @@ def generate_images(pipe, args, device):
 
         # 저장
         image.save(output_path)
-        generated_files.append(output_path)
+        generated_files.append(str(output_path))
         print(f"✅ Saved: {output_path}")
+
+    print("\n" + "="*60)
+    print(f"✅ Successfully generated {len(generated_files)} image(s)")
+    print(f"📁 Output folder: {config.output_dir}")
+    print("="*60)
 
     return generated_files
 
 
 def main():
-    # 환경 설정
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-
-    # 인자 파싱
+    """CLI 실행"""
     parser = argparse.ArgumentParser(
         description="학습된 LoRA 모델로 이미지 생성",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -166,20 +224,26 @@ def main():
     # LoRA 모델 존재 확인
     if not os.path.exists(args.lora_path):
         print(f"❌ Error: LoRA model not found at {args.lora_path}")
-        print(f"Please train the model first: python train.py")
+        print(f"Please train the model first: python training.py")
         return
 
-    # 파이프라인 로드
-    pipe = load_pipeline(args.model_id, args.lora_path, device)
-
     # 이미지 생성
-    generated_files = generate_images(pipe, args, device)
+    config = InferenceConfig(
+        model_id=args.model_id,
+        lora_path=args.lora_path,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        num_images=args.num_images,
+        steps=args.steps,
+        guidance_scale=args.guidance_scale,
+        seed=args.seed,
+        output_dir=args.output_dir
+    )
 
-    # 완료 메시지
-    print("\n" + "="*60)
-    print(f"✅ Successfully generated {len(generated_files)} image(s)")
-    print(f"📁 Output folder: {args.output_dir}")
-    print("="*60)
+    generate_images(
+        lora_path=config.lora_path,
+        config=config
+    )
 
 
 if __name__ == "__main__":
