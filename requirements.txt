@@ -23,3 +23,7 @@ easyocr
 numpy
 tqdm
 datasets
+
+# API
+fastapi
+uvicorn

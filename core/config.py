@@ -11,9 +11,7 @@ class TrainingConfig:
     """학습 설정"""
     # 환경
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    model_id: str = "xyn-ai/anything-v4.0"
-
-    # 데이터
+    model_id: str = "aipicasso/manga-diffusion-poc"
     raw_dataset_path: str = "./dataset"
     clean_dataset_path: str = "./dataset_clean"
     image_size: int = 512
@@ -25,7 +23,7 @@ class TrainingConfig:
     target_modules: list = None  # ["to_q", "to_v", "to_k", "to_out.0"]
 
     # 학습
-    num_epochs: int = 200  # 충분한 학습
+    num_epochs: int = 150  # 충분한 학습
     learning_rate: float = 1e-4  # 학습률
     weight_decay: float = 1e-2
     gradient_accumulation_steps: int = 1
@@ -49,7 +47,7 @@ class TrainingConfig:
 @dataclass
 class InferenceConfig:
     """추론 설정"""
-    model_id: str = "xyn-ai/anything-v4.0"
+    model_id: str = "aipicasso/manga-diffusion-poc"
     lora_path: str = "my_lora_model"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -57,7 +55,7 @@ class InferenceConfig:
     prompt: str = "portrait, high quality"  # sks가 자동으로 추가됨
     negative_prompt: str = "low quality, blurry, ugly, distorted, deformed"
     num_images: int = 1
-    steps: int = 25
+    steps: int = 40
     guidance_scale: float = 7.5
     seed: int = None
 
