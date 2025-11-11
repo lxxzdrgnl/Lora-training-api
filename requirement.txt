@@ -11,3 +11,7 @@ peft
 numpy
 tqdm
 matplotlib
+opencv-python
+easyocr
+rembg
+onnxruntime
