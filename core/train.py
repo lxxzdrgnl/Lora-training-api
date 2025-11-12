@@ -162,7 +162,8 @@ def compute_snr(timesteps, noise_scheduler):
 def train_lora(
     dataset_path: str,
     output_dir: str,
-    config: TrainingConfig = None
+    config: TrainingConfig = None,
+    callback = None
 ):
     """
     LoRA 학습 함수 (Modal API용)
@@ -171,6 +172,7 @@ def train_lora(
         dataset_path: 전처리된 데이터셋 경로
         output_dir: 모델 저장 경로
         config: 학습 설정 (None이면 기본값 사용)
+        callback: 진행도 업데이트 콜백 함수 (status, phase, current_epoch, total_epochs, message)
 
     Returns:
         dict: 학습 결과 정보
@@ -210,6 +212,16 @@ def train_lora(
 
     loss_history = []
     global_step = 0
+
+    # 학습 시작 콜백
+    if callback:
+        callback(
+            status="TRAINING",
+            phase="training",
+            current_epoch=0,
+            total_epochs=config.num_epochs,
+            message=f"학습 시작... (0/{config.num_epochs} 에포크)"
+        )
 
     for epoch in range(config.num_epochs):
         epoch_loss = 0
@@ -293,6 +305,16 @@ def train_lora(
         avg_loss = epoch_loss / len(image_caption_pairs)
         print(f"Epoch {epoch+1} completed - Average Loss: {avg_loss:.4f}")
 
+        # 에포크 완료 콜백
+        if callback:
+            callback(
+                status="TRAINING",
+                phase="training",
+                current_epoch=epoch + 1,
+                total_epochs=config.num_epochs,
+                message=f"학습 진행 중... ({epoch + 1}/{config.num_epochs} 에포크 완료)"
+            )
+
         # 50 에포크마다 체크포인트 저장
         if (epoch + 1) % 50 == 0 or (epoch + 1) == config.num_epochs:
             checkpoint_dir = os.path.join(output_dir, f"checkpoint-{epoch + 1}")
@@ -325,7 +347,8 @@ def train_with_preprocessing(
     raw_dataset_path: str,
     output_dir: str,
     config: TrainingConfig = None,
-    skip_preprocessing: bool = False
+    skip_preprocessing: bool = False,
+    callback = None
 ):
     """
     전처리 + 학습 전체 파이프라인 (Modal API용)
@@ -335,6 +358,7 @@ def train_with_preprocessing(
         output_dir: 모델 저장 경로
         config: 학습 설정
         skip_preprocessing: 전처리 스킵 여부
+        callback: 진행도 업데이트 콜백 함수
 
     Returns:
         dict: 학습 결과
@@ -346,6 +370,16 @@ def train_with_preprocessing(
     clean_dataset_path = config.clean_dataset_path
 
     if not skip_preprocessing:
+        # 전처리 시작 콜백
+        if callback:
+            callback(
+                status="PREPROCESSING",
+                phase="preprocessing",
+                current_epoch=0,
+                total_epochs=0,
+                message="데이터셋 전처리 중..."
+            )
+
         print("\n" + "="*60)
         print("STEP 1: Dataset Preprocessing")
         print("="*60)
@@ -355,6 +389,16 @@ def train_with_preprocessing(
             output_dir=clean_dataset_path
         )
         print(f"Preprocessing result: {preprocess_result}")
+
+        # 전처리 완료 콜백
+        if callback:
+            callback(
+                status="PREPROCESSING",
+                phase="preprocessing",
+                current_epoch=0,
+                total_epochs=0,
+                message="데이터셋 전처리 완료"
+            )
     else:
         print(f"Skipping preprocessing, using: {clean_dataset_path}")
 
@@ -366,7 +410,8 @@ def train_with_preprocessing(
     train_result = train_lora(
         dataset_path=clean_dataset_path,
         output_dir=output_dir,
-        config=config
+        config=config,
+        callback=callback
     )
 
     print("\n" + "="*60)

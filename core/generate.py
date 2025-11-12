@@ -55,7 +55,8 @@ def generate_images(
     guidance_scale: float = None,
     seed: int = None,
     output_dir: str = None,
-    config: InferenceConfig = None
+    config: InferenceConfig = None,
+    callback = None
 ):
     """
     이미지 생성 함수 (Modal API용)
@@ -70,6 +71,7 @@ def generate_images(
         seed: 랜덤 시드
         output_dir: 출력 폴더
         config: 추론 설정 (None이면 기본값 사용)
+        callback: 진행도 업데이트 콜백 함수 (status, current_image, total_images, current_step, total_steps, message)
 
     Returns:
         list: 생성된 이미지 경로 리스트
@@ -125,8 +127,33 @@ def generate_images(
 
     # 이미지 생성
     generated_files = []
+
+    # 생성 시작 콜백
+    if callback:
+        callback(
+            status="GENERATING",
+            current_image=0,
+            total_images=config.num_images,
+            current_step=0,
+            total_steps=config.steps,
+            message=f"이미지 생성 시작... (0/{config.num_images})"
+        )
+
     for i in range(config.num_images):
         print(f"\n[{i+1}/{config.num_images}] Generating...")
+
+        # Step별 콜백 함수 정의
+        def step_callback(pipe_instance, step_index, timestep, callback_kwargs):
+            if callback:
+                callback(
+                    status="GENERATING",
+                    current_image=i + 1,
+                    total_images=config.num_images,
+                    current_step=step_index + 1,
+                    total_steps=config.steps,
+                    message=f"이미지 {i+1}/{config.num_images} 생성 중... (step {step_index+1}/{config.steps})"
+                )
+            return callback_kwargs
 
         with torch.no_grad():
             image = pipe(
@@ -134,7 +161,9 @@ def generate_images(
                 negative_prompt=config.negative_prompt,
                 num_inference_steps=config.steps,
                 guidance_scale=config.guidance_scale,
-                generator=generator
+                generator=generator,
+                callback_on_step_end=step_callback if callback else None,
+                callback_on_step_end_tensor_inputs=["latents"]
             ).images[0]
 
         # 파일명 생성
@@ -146,6 +175,17 @@ def generate_images(
         image.save(output_path)
         generated_files.append(str(output_path))
         print(f"✅ Saved: {output_path}")
+
+        # 이미지 완료 콜백
+        if callback:
+            callback(
+                status="GENERATING",
+                current_image=i + 1,
+                total_images=config.num_images,
+                current_step=config.steps,
+                total_steps=config.steps,
+                message=f"이미지 {i+1}/{config.num_images} 완료"
+            )
 
     print("\n" + "="*60)
     print(f"✅ Successfully generated {len(generated_files)} image(s)")

@@ -48,7 +48,7 @@ class TrainingConfig:
 class InferenceConfig:
     """추론 설정"""
     model_id: str = "stablediffusionapi/anything-v5"
-    lora_path: str = "my_lora_model"
+    lora_path: str = "my_lora_model/checkpoint-200"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 생성 옵션

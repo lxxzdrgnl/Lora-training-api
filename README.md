@@ -160,10 +160,13 @@ python main.py
 
 ### 주요 기능
 
+- **실시간 진행률 추적**: 학습 및 이미지 생성의 진행 상태를 실시간으로 확인 가능
+  - 학습: 전처리 단계, 에포크별 진행도 추적
+  - 이미지 생성: step별 진행도 추적
 - **CORS 지원**: Vue.js 등 프론트엔드에서 직접 API 호출 가능
 - **정적 파일 서빙**: 생성된 이미지를 `/static/` 경로로 제공
-- **동시 학습 방지**: Thread Lock으로 한 번에 하나의 학습만 진행
-- **백그라운드 작업**: 학습이 백그라운드에서 비동기로 실행됨
+- **동시 작업 방지**: Thread Lock으로 한 번에 하나의 학습/생성만 진행
+- **백그라운드 작업**: 학습과 이미지 생성이 백그라운드에서 비동기로 실행됨
 
 ### API 엔드포인트 상세
 
@@ -200,37 +203,97 @@ python main.py
         ```
 
 *   **`GET /train/status`**
-    *   **설명**: 현재 학습 진행 상태를 확인합니다.
+    *   **설명**: 현재 학습 진행 상태를 **실시간**으로 확인합니다. 프론트엔드에서 이 엔드포인트를 폴링하여 진행률을 표시할 수 있습니다.
     *   **성공 응답 (200)**: 여러 상태에 대한 예시입니다.
+        *   대기 중:
+            ```json
+            {
+              "status": "IDLE",
+              "progress": {
+                "phase": "",
+                "current_epoch": 0,
+                "total_epochs": 0
+              },
+              "message": "대기 중"
+            }
+            ```
+        *   전처리 중:
+            ```json
+            {
+              "status": "PREPROCESSING",
+              "progress": {
+                "phase": "preprocessing",
+                "current_epoch": 0,
+                "total_epochs": 0
+              },
+              "message": "데이터셋 전처리 중..."
+            }
+            ```
         *   학습 진행 중:
             ```json
             {
-              "is_training": true,
-              "message": "Training in progress..."
+              "status": "TRAINING",
+              "progress": {
+                "phase": "training",
+                "current_epoch": 50,
+                "total_epochs": 250
+              },
+              "message": "학습 진행 중... (50/250 에포크 완료)"
             }
             ```
         *   학습 완료:
             ```json
             {
-              "is_training": false,
-              "message": "Training completed successfully."
+              "status": "SUCCESS",
+              "progress": {
+                "phase": "",
+                "current_epoch": 0,
+                "total_epochs": 0
+              },
+              "message": "학습이 성공적으로 완료되었습니다."
             }
             ```
-        *   학습 중 아님 (초기 상태):
+        *   학습 실패:
             ```json
             {
-              "is_training": false,
-              "message": "Not training"
+              "status": "FAIL",
+              "progress": {
+                "phase": "",
+                "current_epoch": 0,
+                "total_epochs": 0
+              },
+              "message": "학습 실패: Some error message"
             }
             ```
+    *   **상태 값**:
+        - `IDLE`: 대기 중
+        - `PREPROCESSING`: 전처리 진행 중
+        - `TRAINING`: 학습 진행 중 (에포크마다 업데이트)
+        - `SUCCESS`: 학습 완료
+        - `FAIL`: 학습 실패
+
+*   **`GET /train/stream`**
+    *   **설명**: **Server-Sent Events (SSE)**를 사용하여 학습 진행률을 실시간으로 스트리밍합니다. 폴링 없이 서버가 자동으로 상태 업데이트를 푸시합니다.
+    *   **사용법**: JavaScript의 `EventSource` API를 사용하여 연결합니다.
+        ```javascript
+        const eventSource = new EventSource('http://localhost:8000/train/stream');
+        eventSource.onmessage = (event) => {
+          const status = JSON.parse(event.data);
+          console.log(status);
+        };
+        ```
+    *   **응답 형식**: `text/event-stream` (SSE 스트림)
+    *   **참고**:
+        - 학습이 완료되거나 실패하면 자동으로 스트림이 종료됩니다.
+        - 상태가 변경될 때마다 업데이트를 전송합니다.
 
 *   **`POST /generate`**
-    *   **설명**: 프롬프트를 기반으로 이미지를 생성하고, 생성된 이미지의 URL 목록을 반환합니다.
+    *   **설명**: 프롬프트를 기반으로 이미지 생성을 시작합니다. 이미지 생성은 백그라운드에서 실행됩니다.
     *   **요청 본문**:
         ```json
         {
           "prompt": "1girl, black hair, long hair, black and white manga style",
-          "lora_path": "my_lora_model",
+          "lora_path": "my_lora_model/checkpoint-250",
           "num_images": 2,
           "steps": 40,
           "guidance_scale": 7.5
@@ -239,43 +302,244 @@ python main.py
     *   **성공 응답 (200)**:
         ```json
         {
-          "image_urls": [
-            "http://127.0.0.1:8000/static/20251111_123456_1.png",
-            "http://127.0.0.1:8000/static/20251111_123456_2.png"
-          ]
+          "message": "Image generation started in the background. Check /generate/status for progress."
         }
         ```
-    *   **참고**:
-        - 생성된 이미지는 `outputs/` 폴더에 저장됩니다.
-        - `/static/` 경로를 통해 브라우저에서 직접 접근 가능합니다.
-        - CORS가 설정되어 있어 Vue.js 등의 프론트엔드에서 이미지 로드 가능합니다.
+    *   **에러 응답 (400)**: 이미 이미지 생성이 진행 중일 때 발생합니다.
+        ```json
+        {
+          "message": "Image generation is already in progress."
+        }
+        ```
     *   **에러 응답 (404)**: LoRA 모델을 찾을 수 없을 때 발생합니다.
         ```json
         {
           "message": "LoRA model not found at my_lora_model. Please train the model first."
         }
         ```
-    *   **에러 응답 (422)**: 요청 본문의 내용이 유효하지 않을 때 발생합니다. (예: `prompt` 필드 누락)
-        ```json
-        {
-          "detail": [
+
+*   **`GET /generate/status`**
+    *   **설명**: 현재 이미지 생성 진행 상태를 **실시간**으로 확인합니다. step별 진행률을 추적할 수 있습니다.
+    *   **성공 응답 (200)**: 여러 상태에 대한 예시입니다.
+        *   대기 중:
+            ```json
             {
-              "loc": [
-                "body",
-                "prompt"
-              ],
-              "msg": "field required",
-              "type": "value_error.missing"
+              "status": "IDLE",
+              "progress": {
+                "current_image": 0,
+                "total_images": 0,
+                "current_step": 0,
+                "total_steps": 0
+              },
+              "message": "대기 중"
             }
-          ]
-        }
+            ```
+        *   생성 진행 중:
+            ```json
+            {
+              "status": "GENERATING",
+              "progress": {
+                "current_image": 1,
+                "total_images": 3,
+                "current_step": 20,
+                "total_steps": 40
+              },
+              "message": "이미지 1/3 생성 중... (step 20/40)"
+            }
+            ```
+        *   생성 완료:
+            ```json
+            {
+              "status": "SUCCESS",
+              "progress": {
+                "current_image": 0,
+                "total_images": 0,
+                "current_step": 0,
+                "total_steps": 0
+              },
+              "message": "이미지 생성 완료 (3개)"
+            }
+            ```
+        *   생성 실패:
+            ```json
+            {
+              "status": "FAIL",
+              "progress": {
+                "current_image": 0,
+                "total_images": 0,
+                "current_step": 0,
+                "total_steps": 0
+              },
+              "message": "이미지 생성 실패: Some error message"
+            }
+            ```
+    *   **상태 값**:
+        - `IDLE`: 대기 중
+        - `GENERATING`: 이미지 생성 중 (step별 실시간 업데이트)
+        - `SUCCESS`: 생성 완료
+        - `FAIL`: 생성 실패
+    *   **참고**:
+        - 생성이 완료되면 `status`에 `image_urls` 필드가 추가되어 생성된 이미지 URL 목록이 포함됩니다.
+        - 생성된 이미지는 `outputs/` 폴더에 저장됩니다.
+        - `/static/` 경로를 통해 브라우저에서 직접 접근 가능합니다.
+        - CORS가 설정되어 있어 Vue.js 등의 프론트엔드에서 이미지 로드 가능합니다.
+
+*   **`GET /generate/stream`**
+    *   **설명**: **Server-Sent Events (SSE)**를 사용하여 이미지 생성 진행률을 실시간으로 스트리밍합니다. step별 진행도를 폴링 없이 받을 수 있습니다.
+    *   **사용법**: JavaScript의 `EventSource` API를 사용하여 연결합니다.
+        ```javascript
+        const eventSource = new EventSource('http://localhost:8000/generate/stream');
+        eventSource.onmessage = (event) => {
+          const status = JSON.parse(event.data);
+          console.log(`Step: ${status.progress.current_step}/${status.progress.total_steps}`);
+        };
         ```
-    *   **에러 응답 (500)**: 서버 내부에서 이미지 생성 중 오류가 발생했을 때입니다.
-        ```json
-        {
-          "message": "An error occurred during image generation: Some internal server error."
-        }
-        ```
+    *   **응답 형식**: `text/event-stream` (SSE 스트림)
+    *   **참고**:
+        - 이미지 생성이 완료되거나 실패하면 자동으로 스트림이 종료됩니다.
+        - 상태가 변경될 때마다 업데이트를 전송합니다 (약 0.3초마다 체크).
+        - 생성 완료 시 `image_urls` 필드에 생성된 이미지 URL 목록이 포함됩니다.
+
+### 진행률 추적 사용 예시
+
+**Server-Sent Events (SSE)**를 사용하여 **폴링 없이** 서버가 자동으로 진행률을 푸시합니다.
+
+#### JavaScript (학습 진행률 추적 - SSE 방식)
+
+```javascript
+// 학습 시작 및 실시간 진행률 추적
+async function startTraining() {
+  // 1. 학습 시작
+  const response = await fetch('http://localhost:8000/train', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      raw_dataset_path: './dataset',
+      output_dir: 'my_lora_model',
+      skip_preprocessing: false
+    })
+  });
+  const data = await response.json();
+  console.log(data.message);
+
+  // 2. SSE로 실시간 진행률 받기 (폴링 불필요!)
+  const eventSource = new EventSource('http://localhost:8000/train/stream');
+
+  eventSource.onmessage = (event) => {
+    const status = JSON.parse(event.data);
+    console.log(`상태: ${status.status}`);
+    console.log(`메시지: ${status.message}`);
+
+    if (status.status === 'TRAINING') {
+      const { current_epoch, total_epochs } = status.progress;
+      const progress = (current_epoch / total_epochs * 100).toFixed(1);
+      console.log(`진행률: ${progress}% (${current_epoch}/${total_epochs} 에포크)`);
+
+      // UI 업데이트 예시
+      document.getElementById('progress').style.width = `${progress}%`;
+      document.getElementById('status').textContent = status.message;
+    }
+
+    // 완료 또는 실패 시 자동으로 연결 종료됨
+    if (status.status === 'SUCCESS' || status.status === 'FAIL') {
+      console.log('학습 종료:', status.message);
+      eventSource.close();
+    }
+  };
+
+  eventSource.onerror = (error) => {
+    console.error('SSE 연결 오류:', error);
+    eventSource.close();
+  };
+}
+```
+
+#### JavaScript (이미지 생성 진행률 추적 - SSE 방식)
+
+```javascript
+// 이미지 생성 시작 및 실시간 진행률 추적
+async function startGeneration() {
+  // 1. 이미지 생성 시작
+  const response = await fetch('http://localhost:8000/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: 'a beautiful girl',
+      lora_path: 'my_lora_model/checkpoint-250',
+      num_images: 3,
+      steps: 40
+    })
+  });
+  const data = await response.json();
+  console.log(data.message);
+
+  // 2. SSE로 실시간 진행률 받기 (폴링 불필요!)
+  const eventSource = new EventSource('http://localhost:8000/generate/stream');
+
+  eventSource.onmessage = (event) => {
+    const status = JSON.parse(event.data);
+
+    if (status.status === 'GENERATING') {
+      const { current_image, total_images, current_step, total_steps } = status.progress;
+      console.log(`이미지: ${current_image}/${total_images}`);
+      console.log(`Step: ${current_step}/${total_steps}`);
+
+      const imageProgress = (current_image / total_images * 100).toFixed(1);
+      const stepProgress = (current_step / total_steps * 100).toFixed(1);
+      console.log(`전체 진행률: ${imageProgress}%, 현재 이미지: ${stepProgress}%`);
+
+      // UI 업데이트 예시
+      document.getElementById('image-progress').textContent = `${current_image}/${total_images}`;
+      document.getElementById('step-progress').style.width = `${stepProgress}%`;
+    }
+
+    // 완료 시 이미지 URL 가져오기
+    if (status.status === 'SUCCESS') {
+      console.log('생성 완료!');
+      console.log('이미지 URLs:', status.image_urls);
+      eventSource.close();
+
+      // 이미지 표시 예시
+      status.image_urls.forEach(url => {
+        const img = document.createElement('img');
+        img.src = url;
+        document.getElementById('results').appendChild(img);
+      });
+    }
+
+    // 실패 시 연결 종료
+    if (status.status === 'FAIL') {
+      console.error('생성 실패:', status.message);
+      eventSource.close();
+    }
+  };
+
+  eventSource.onerror = (error) => {
+    console.error('SSE 연결 오류:', error);
+    eventSource.close();
+  };
+}
+```
+
+#### 기존 방식 (폴링) 사용하기
+
+SSE를 사용할 수 없는 환경에서는 `/train/status` 및 `/generate/status` 엔드포인트를 폴링하여 상태를 확인할 수 있습니다.
+
+```javascript
+// 폴링 방식 예시 (1초마다 상태 확인)
+async function pollTrainingStatus() {
+  const interval = setInterval(async () => {
+    const response = await fetch('http://localhost:8000/train/status');
+    const status = await response.json();
+
+    // 상태 처리 로직...
+
+    if (status.status === 'SUCCESS' || status.status === 'FAIL') {
+      clearInterval(interval);
+    }
+  }, 1000);
+}
+```
 
 ## 프로젝트 구조
 
