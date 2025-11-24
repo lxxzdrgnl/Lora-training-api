@@ -47,6 +47,7 @@ checkpoints/
 validation_images/
 outputs/
 dataset_clean/
+temp/
 training_loss.png
 *.png
 *.jpg
@@ -77,3 +78,13 @@ wandb/
 # HuggingFace cache
 .cache/
 huggingface/
+
+# Modal
+.modal/
+*.modal.toml
+
+# 환경 변수 및 시크릿
+.env
+.env.local
+*.secret
+secrets.txt

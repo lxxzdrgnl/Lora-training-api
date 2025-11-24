@@ -18,31 +18,56 @@ def load_pipeline(model_id: str, lora_path: str, device: str):
     Stable Diffusion 파이프라인 + LoRA 로드
 
     Args:
-        model_id: 베이스 모델 ID
-        lora_path: LoRA 모델 경로
+        model_id: 베이스 모델 ID 또는 로컬 경로
+        lora_path: LoRA 모델 경로 (디렉토리 또는 .safetensors 파일)
         device: 디바이스 (cuda/cpu)
 
     Returns:
         StableDiffusionPipeline: 로드된 파이프라인
     """
-    print(f"\nLoading base model: {model_id}")
+    # Modal 이미지에 포함된 베이스 모델 사용
+    # /base_models/anything-v5 경로에 이미지 빌드 시 다운로드됨
+    if os.path.exists("/base_models/anything-v5"):
+        base_model_path = "/base_models/anything-v5"
+        print(f"\n✅ Using pre-cached base model from image: {base_model_path}")
+    else:
+        # 로컬 환경에서는 HuggingFace Hub에서 다운로드
+        base_model_path = model_id
+        print(f"\n📥 Downloading base model from HuggingFace: {model_id}")
+
+    print(f"Loading base model: {base_model_path}")
     pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
+        base_model_path,
         torch_dtype=torch.float16,
         safety_checker=None
     )
 
     print(f"Loading LoRA weights: {lora_path}")
-    pipe.unet = PeftModel.from_pretrained(
-        pipe.unet,
-        lora_path,
-        torch_dtype=torch.float16
-    )
 
+    # LoRA 경로 확인 (디렉토리 또는 단일 .safetensors 파일)
+    if os.path.isfile(lora_path) and lora_path.endswith('.safetensors'):
+        # 단일 safetensors 파일 (Civitai 다운로드 형식)
+        lora_file = lora_path
+        print(f"Found single LoRA file: {lora_file}")
+    elif os.path.isdir(lora_path):
+        # 디렉토리 내에서 safetensors 파일 찾기
+        safetensors_files = [f for f in os.listdir(lora_path) if f.endswith('.safetensors')]
+        if not safetensors_files:
+            raise ValueError(f"No .safetensors file found in {lora_path}")
+        lora_file = os.path.join(lora_path, safetensors_files[0])
+        print(f"Found LoRA file in directory: {safetensors_files[0]}")
+    else:
+        raise ValueError(f"Invalid LoRA path: {lora_path}")
+
+    # Diffusers의 load_lora_weights()로 WebUI 형식 직접 로드
+    # 이 메서드는 Civitai에서 다운받은 단일 safetensors 파일을 바로 로드할 수 있음
+    print(f"Loading LoRA with Diffusers (WebUI format support)...")
+    pipe.load_lora_weights(lora_file)
+
+    # GPU로 이동
     pipe.to(device)
-    pipe.unet.eval()
 
-    print("✅ Model loaded successfully!\n")
+    print("✅ LoRA loaded successfully in WebUI/Civitai format!\n")
     return pipe
 
 

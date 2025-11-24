@@ -226,6 +226,17 @@ def train_lora(
     for epoch in range(config.num_epochs):
         epoch_loss = 0
         progress_bar = tqdm(image_caption_pairs, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        total_batches = len(image_caption_pairs)
+
+        # 에포크 시작 시 콜백 호출
+        if callback:
+            callback(
+                status="TRAINING",
+                phase="training",
+                current_epoch=epoch + 1,
+                total_epochs=config.num_epochs,
+                message=f"Training {epoch + 1}/{config.num_epochs}"
+            )
 
         for batch_idx, (img_path, caption) in enumerate(progress_bar):
             # 이미지 로드
@@ -305,22 +316,17 @@ def train_lora(
         avg_loss = epoch_loss / len(image_caption_pairs)
         print(f"Epoch {epoch+1} completed - Average Loss: {avg_loss:.4f}")
 
-        # 에포크 완료 콜백
-        if callback:
-            callback(
-                status="TRAINING",
-                phase="training",
-                current_epoch=epoch + 1,
-                total_epochs=config.num_epochs,
-                message=f"학습 진행 중... ({epoch + 1}/{config.num_epochs} 에포크 완료)"
-            )
-
         # 50 에포크마다 체크포인트 저장
         if (epoch + 1) % 50 == 0 or (epoch + 1) == config.num_epochs:
             checkpoint_dir = os.path.join(output_dir, f"checkpoint-{epoch + 1}")
             print(f"\nSaving checkpoint to: {checkpoint_dir}")
             os.makedirs(checkpoint_dir, exist_ok=True)
-            unet.save_pretrained(checkpoint_dir)
+
+            # WebUI/Civitai 형식으로 저장 (단일 .safetensors 파일)
+            from .lora_utils import save_lora_as_webui
+
+            safetensors_path = os.path.join(checkpoint_dir, "lora_weights.safetensors")
+            save_lora_as_webui(unet, safetensors_path)
 
     # 최종 모델 저장 메시지 (이제 체크포인트로 저장되므로 주석 처리 또는 수정)
     # print(f"\nSaving model to: {output_dir}")

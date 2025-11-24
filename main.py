@@ -6,6 +6,9 @@ LoRA 학습 및 이미지 생성을 위한 API
 import os
 import json
 import asyncio
+import requests
+import shutil
+from pathlib import Path
 from threading import Lock
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -41,10 +44,12 @@ LoRA 모델 학습 및 이미지 생성을 위한 RESTful API 서버입니다.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://bluemingai.ap-northeast-2.elasticbeanstalk.com"
         "http://localhost:8080",
         "http://localhost:3000",
         "http://localhost:5173",  # Vite 기본 포트
-        "http://127.0.0.1:5173",  # localhost 대신 127.0.0.1
+        "http://blueming-front.s3-website.ap-northeast-2.amazonaws.com/"
+        ,  # localhost 대신 127.0.0.1
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -55,7 +60,103 @@ app.add_middleware(
 # --- 정적 파일 마운트 ---
 # 'outputs' 디렉토리를 '/static' 경로에 마운트하여 이미지 URL로 접근 가능하게 합니다.
 os.makedirs("outputs", exist_ok=True)
+os.makedirs("temp", exist_ok=True)  # 임시 파일 저장용 디렉토리
 app.mount("/static", StaticFiles(directory="outputs"), name="static")
+
+# --- S3 다운로드/업로드 유틸리티 ---
+def download_from_s3_url(s3_url: str, local_path: str) -> str:
+    """
+    S3 Presigned URL에서 파일을 다운로드합니다.
+
+    Args:
+        s3_url: S3 Presigned URL
+        local_path: 로컬 저장 경로
+
+    Returns:
+        다운로드된 파일의 경로
+    """
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    response = requests.get(s3_url, stream=True)
+    response.raise_for_status()
+
+    with open(local_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    return local_path
+
+
+def upload_to_s3(local_file_path: str, s3_key: str, bucket_name: str = "lora-training-data-bucket", content_type: str = None) -> str:
+    """
+    로컬 파일을 S3에 업로드합니다.
+
+    Args:
+        local_file_path: 업로드할 로컬 파일 경로
+        s3_key: S3 키 (예: models/user-123/model.safetensors)
+        bucket_name: S3 버킷 이름
+        content_type: Content-Type (예: image/png, application/octet-stream)
+
+    Returns:
+        S3 Key
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    try:
+        s3_client = boto3.client('s3')
+
+        # Content-Type 자동 감지
+        if content_type is None:
+            if local_file_path.endswith('.png'):
+                content_type = 'image/png'
+            elif local_file_path.endswith('.jpg') or local_file_path.endswith('.jpeg'):
+                content_type = 'image/jpeg'
+            else:
+                content_type = 'application/octet-stream'
+
+        # 파일 업로드
+        s3_client.upload_file(
+            local_file_path,
+            bucket_name,
+            s3_key,
+            ExtraArgs={'ContentType': content_type}
+        )
+
+        print(f"✅ Uploaded to S3: s3://{bucket_name}/{s3_key}")
+        return s3_key
+
+    except ClientError as e:
+        print(f"❌ S3 upload failed: {e}")
+        raise
+
+def download_training_images(s3_urls: List[str]) -> str:
+    """
+    여러 S3 URL에서 학습용 이미지들을 다운로드합니다.
+
+    Args:
+        s3_urls: S3 Presigned URL 리스트
+
+    Returns:
+        데이터셋 경로 (temp/dataset_xxxxx)
+    """
+    # temp 디렉토리 안에 고유한 데이터셋 폴더 생성
+    dataset_id = os.urandom(8).hex()
+    dataset_path = os.path.join("temp", f"dataset_{dataset_id}")
+    os.makedirs(dataset_path, exist_ok=True)
+
+    for idx, s3_url in enumerate(s3_urls):
+        # 파일 확장자 추출 (URL에서)
+        ext = ".jpg"  # 기본값
+        if ".png" in s3_url.lower():
+            ext = ".png"
+        elif ".jpeg" in s3_url.lower() or ".jpg" in s3_url.lower():
+            ext = ".jpg"
+
+        local_path = os.path.join(dataset_path, f"image_{idx:04d}{ext}")
+        download_from_s3_url(s3_url, local_path)
+
+    return dataset_path
 
 # --- 모델 및 상태 관리 ---
 training_status = {
@@ -85,14 +186,20 @@ generation_lock = Lock()
 
 # 요청 모델
 class TrainRequest(BaseModel):
-    raw_dataset_path: str = Field("./dataset", description="원본 데이터셋 경로")
-    output_dir: str = Field("my_lora_model", description="학습된 모델이 저장될 경로")
+    user_id: str = Field(..., description="사용자 ID")
+    model_name: str = Field(..., description="모델 이름")
+    training_image_urls: Optional[List[str]] = Field(None, description="S3에 업로드된 학습 이미지 URL 리스트")
+    raw_dataset_path: Optional[str] = Field(None, description="원본 데이터셋 경로 (로컬 파일 사용 시)")
+    output_dir: Optional[str] = Field(None, description="학습된 모델이 저장될 경로 (자동 생성됨)")
     skip_preprocessing: bool = Field(False, description="전처리 과정 스킵 여부")
+    callback_url: Optional[str] = Field(None, description="학습 완료 시 호출할 Spring Boot API URL")
 
 class GenerateRequest(BaseModel):
+    user_id: Optional[str] = Field(None, description="사용자 ID (S3 경로 생성용)")
     prompt: str = Field(..., description="이미지 생성을 위한 프롬프트")
     negative_prompt: Optional[str] = Field("low quality, blurry, ugly, distorted, deformed", description="이미지 생성 시 제외할 요소들에 대한 프롬프트")
-    lora_path: str = Field("my_lora_model", description="사용할 LoRA 모델 경로")
+    lora_model_url: Optional[str] = Field(None, description="S3에 저장된 LoRA 모델 파일 URL (.safetensors)")
+    lora_path: Optional[str] = Field(None, description="사용할 LoRA 모델 경로 (로컬 파일 사용 시)")
     num_images: int = Field(1, description="생성할 이미지 개수")
     steps: int = Field(40, description="이미지 생성 스텝 수")
     guidance_scale: float = Field(7.5, description="프롬프트 충실도 (CFG Scale)")
@@ -150,18 +257,60 @@ def run_training_task(req: TrainRequest):
         training_status["progress"]["total_epochs"] = total_epochs
         training_status["message"] = message
 
+    temp_dataset_path = None  # 임시 파일 경로 추적
+    model_file_path = None
+    s3_key = None
+
     try:
+        # S3 URL이 제공된 경우 이미지 다운로드
+        if req.training_image_urls:
+            update_status(
+                status="PREPROCESSING",
+                phase="downloading",
+                message="S3에서 학습 이미지 다운로드 중..."
+            )
+            # temp/dataset_xxxxx에 다운로드
+            temp_dataset_path = download_training_images(req.training_image_urls)
+            raw_dataset_path = temp_dataset_path
+        else:
+            raw_dataset_path = req.raw_dataset_path or "./dataset"
+
+        # 출력 디렉토리 자동 생성 (models/{user_id}/{model_name})
+        output_dir = req.output_dir or f"models/{req.user_id}/{req.model_name}"
+
         config = TrainingConfig(
-            raw_dataset_path=req.raw_dataset_path,
-            output_dir=req.output_dir
+            raw_dataset_path=raw_dataset_path,
+            output_dir=output_dir
         )
         train_with_preprocessing(
-            raw_dataset_path=req.raw_dataset_path,
-            output_dir=req.output_dir,
+            raw_dataset_path=raw_dataset_path,
+            output_dir=output_dir,
             config=config,
             skip_preprocessing=req.skip_preprocessing,
             callback=update_status
         )
+
+        # 학습 완료 후 S3에 모델 업로드
+        update_status(
+            status="SUCCESS",
+            phase="uploading",
+            message="S3에 모델 업로드 중..."
+        )
+
+        # 모델 파일 찾기 (pytorch_lora_weights.safetensors)
+        model_file_path = os.path.join(output_dir, "pytorch_lora_weights.safetensors")
+        if not os.path.exists(model_file_path):
+            raise FileNotFoundError(f"Model file not found: {model_file_path}")
+
+        # S3 키 생성 (models/{user_id}/{model_name}.safetensors)
+        s3_key = f"models/{req.user_id}/{req.model_name}.safetensors"
+
+        # S3 업로드
+        upload_to_s3(model_file_path, s3_key)
+
+        # 파일 크기 계산
+        file_size = os.path.getsize(model_file_path)
+
         update_status(
             status="SUCCESS",
             phase="",
@@ -169,6 +318,23 @@ def run_training_task(req: TrainRequest):
             total_epochs=0,
             message="학습이 성공적으로 완료되었습니다."
         )
+
+        # Spring Boot 콜백 호출
+        if req.callback_url:
+            try:
+                callback_data = {
+                    "userId": req.user_id,
+                    "modelName": req.model_name,
+                    "s3Key": s3_key,
+                    "fileSize": file_size,
+                    "status": "SUCCESS"
+                }
+                response = requests.post(req.callback_url, json=callback_data, timeout=10)
+                response.raise_for_status()
+                print(f"✅ Callback to Spring Boot successful: {req.callback_url}")
+            except Exception as callback_error:
+                print(f"❌ Callback to Spring Boot failed: {callback_error}")
+
     except Exception as e:
         update_status(
             status="FAIL",
@@ -178,7 +344,28 @@ def run_training_task(req: TrainRequest):
             message=f"학습 실패: {str(e)}"
         )
 
-def run_generation_task(req: GenerateRequest, base_url: str):
+        # 실패 시에도 콜백 호출
+        if req.callback_url:
+            try:
+                callback_data = {
+                    "userId": req.user_id,
+                    "modelName": req.model_name,
+                    "status": "FAIL",
+                    "error": str(e)
+                }
+                requests.post(req.callback_url, json=callback_data, timeout=10)
+            except:
+                pass
+
+    finally:
+        # S3에서 다운로드한 임시 파일 정리
+        if temp_dataset_path and os.path.exists(temp_dataset_path):
+            try:
+                shutil.rmtree(temp_dataset_path)
+            except Exception as e:
+                print(f"임시 파일 정리 실패: {e}")
+
+def run_generation_task(req: GenerateRequest, base_url: str, user_id: str = None):
     """백그라운드에서 이미지 생성을 실행하는 함수"""
     global generation_status
 
@@ -194,9 +381,26 @@ def run_generation_task(req: GenerateRequest, base_url: str):
         generation_status["progress"]["total_steps"] = total_steps
         generation_status["message"] = message
 
+    temp_lora_path = None  # 임시 파일 경로 추적
     try:
+        # S3 URL에서 LoRA 모델 다운로드
+        if req.lora_model_url:
+            update_generation_status(
+                status="GENERATING",
+                message="S3에서 LoRA 모델 다운로드 중..."
+            )
+            # temp/lora_xxxxx에 다운로드
+            lora_id = os.urandom(8).hex()
+            temp_lora_path = os.path.join("temp", f"lora_{lora_id}")
+            os.makedirs(temp_lora_path, exist_ok=True)
+            lora_model_path = os.path.join(temp_lora_path, "pytorch_lora_weights.safetensors")
+            download_from_s3_url(req.lora_model_url, lora_model_path)
+            lora_path = temp_lora_path
+        else:
+            lora_path = req.lora_path or "my_lora_model"
+
         config = InferenceConfig(
-            lora_path=req.lora_path,
+            lora_path=lora_path,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             num_images=req.num_images,
@@ -217,20 +421,38 @@ def run_generation_task(req: GenerateRequest, base_url: str):
                 message="이미지 생성 실패"
             )
         else:
-            image_urls = [
-                f"{base_url}static/{os.path.basename(path)}"
-                for path in generated_files
-            ]
+            # S3에 생성된 이미지 업로드
+            update_generation_status(
+                status="SUCCESS",
+                message="S3에 이미지 업로드 중..."
+            )
+
+            s3_keys = []
+            for generated_file in generated_files:
+                # S3 키 생성 (user-{user_id}/{filename}.png)
+                filename = os.path.basename(generated_file)
+                s3_key = f"user-{user_id}/{filename}" if user_id else f"generated/{filename}"
+
+                # S3 업로드
+                upload_to_s3(
+                    local_file_path=generated_file,
+                    s3_key=s3_key,
+                    bucket_name="lora-generated-image-bucket"
+                )
+
+                s3_keys.append(s3_key)
+
             update_generation_status(
                 status="SUCCESS",
                 current_image=0,
                 total_images=0,
                 current_step=0,
                 total_steps=0,
-                message=f"이미지 생성 완료 ({len(image_urls)}개)"
+                message=f"이미지 생성 완료 ({len(s3_keys)}개)"
             )
-            # 생성된 이미지 URL 저장
-            generation_status["image_urls"] = image_urls
+
+            # S3 키 목록 저장 (Spring Boot에서 조회할 수 있도록)
+            generation_status["s3_keys"] = s3_keys
 
     except Exception as e:
         update_generation_status(
@@ -241,6 +463,13 @@ def run_generation_task(req: GenerateRequest, base_url: str):
             total_steps=0,
             message=f"이미지 생성 실패: {str(e)}"
         )
+    finally:
+        # S3에서 다운로드한 임시 모델 파일 정리
+        if temp_lora_path and os.path.exists(temp_lora_path):
+            try:
+                shutil.rmtree(temp_lora_path)
+            except Exception as e:
+                print(f"임시 파일 정리 실패: {e}")
 
 # --- API 엔드포인트 ---
 @app.get(
@@ -460,9 +689,17 @@ async def generate_image_api(request: Request, req: GenerateRequest, background_
 
     - 이미지 생성은 백그라운드에서 실행되며, 완료까지 시간이 소요될 수 있습니다.
     - 생성 진행 상태는 `/generate/status` 엔드포인트로 확인할 수 있습니다.
-    - 생성된 이미지는 `outputs/` 폴더에 저장됩니다.
+    - 생성된 이미지는 S3에 업로드됩니다.
     """
-    if not os.path.exists(req.lora_path):
+    # S3 URL이나 로컬 경로 중 하나는 필수
+    if not req.lora_model_url and not req.lora_path:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Either lora_model_url or lora_path must be provided."}
+        )
+
+    # 로컬 경로를 사용하는 경우에만 파일 존재 여부 확인
+    if req.lora_path and not req.lora_model_url and not os.path.exists(req.lora_path):
         return JSONResponse(
             status_code=404,
             content={"message": f"LoRA model not found at {req.lora_path}. Please train the model first."}
@@ -481,10 +718,12 @@ async def generate_image_api(request: Request, req: GenerateRequest, background_
         generation_status["progress"]["current_step"] = 0
         generation_status["progress"]["total_steps"] = req.steps
         generation_status["message"] = "이미지 생성 준비 중..."
-        generation_status["image_urls"] = []
+        generation_status["s3_keys"] = []
 
     base_url = str(request.base_url)
-    background_tasks.add_task(run_generation_task, req, base_url)
+    # user_id를 GenerateRequest에서 추출 (없으면 None)
+    user_id = getattr(req, 'user_id', None)
+    background_tasks.add_task(run_generation_task, req, base_url, user_id)
     return {"message": "Image generation started in the background. Check /generate/status for progress."}
 
 @app.get(
@@ -594,6 +833,32 @@ async def stream_generation_status():
             "X-Accel-Buffering": "no"
         }
     )
+
+@app.get(
+    "/generate/images",
+    summary="생성된 이미지 S3 키 목록 조회",
+    description="""
+생성 완료 후 Spring Boot에서 호출하여 S3 키 목록을 가져갑니다.
+- 생성 완료 후에만 호출해야 합니다.
+- S3 키 목록을 반환합니다 (예: ["user-123/20250118_143025_1.png", ...])
+    """
+)
+def get_generated_image_keys():
+    """생성된 이미지의 S3 키 목록을 반환합니다."""
+    if generation_status["status"] != "SUCCESS":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": "Image generation is not completed yet.",
+                "status": generation_status["status"]
+            }
+        )
+
+    s3_keys = generation_status.get("s3_keys", [])
+    return {
+        "s3_keys": s3_keys,
+        "count": len(s3_keys)
+    }
 
 if __name__ == "__main__":
     import uvicorn
