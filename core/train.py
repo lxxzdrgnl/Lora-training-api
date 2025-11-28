@@ -78,7 +78,7 @@ def load_models(config: TrainingConfig):
     return vae, unet, text_encoder, tokenizer, noise_scheduler
 
 
-def load_images_with_captions(dataset_path: str, trigger_word: str = "sks"):
+def load_images_with_captions(dataset_path: str, trigger_word: str = None):
     """이미지 파일 + 캡션 로드"""
     path = Path(dataset_path)
     image_files = list(path.glob("*.png")) + list(path.glob("*.jpg"))
@@ -97,8 +97,8 @@ def load_images_with_captions(dataset_path: str, trigger_word: str = "sks"):
             with open(caption_file, 'r', encoding='utf-8') as f:
                 caption = f.read().strip()
         else:
-            # 없으면 기본 trigger word만 사용
-            caption = trigger_word
+            # 없으면 기본 trigger word 사용 (None이면 빈 문자열)
+            caption = trigger_word if trigger_word else ""
 
         image_caption_pairs.append((img_file, caption))
 
@@ -326,7 +326,12 @@ def train_lora(
             from .lora_utils import save_lora_as_webui
 
             safetensors_path = os.path.join(checkpoint_dir, "lora_weights.safetensors")
-            save_lora_as_webui(unet, safetensors_path)
+            save_lora_as_webui(
+                unet,
+                safetensors_path,
+                lora_alpha=config.lora_alpha,
+                lora_rank=config.lora_r
+            )
 
     # 최종 모델 저장 메시지 (이제 체크포인트로 저장되므로 주석 처리 또는 수정)
     # print(f"\nSaving model to: {output_dir}")
@@ -372,10 +377,11 @@ def train_with_preprocessing(
     if config is None:
         config = TrainingConfig()
 
-    # 1. 전처리
+    # 1. 전처리 및 캡셔닝
     clean_dataset_path = config.clean_dataset_path
 
     if not skip_preprocessing:
+        # 전처리 + 캡셔닝 (전체 파이프라인)
         # 전처리 시작 콜백
         if callback:
             callback(
@@ -383,16 +389,17 @@ def train_with_preprocessing(
                 phase="preprocessing",
                 current_epoch=0,
                 total_epochs=0,
-                message="데이터셋 전처리 중..."
+                message="데이터셋 전처리 및 캡셔닝 중..."
             )
 
         print("\n" + "="*60)
-        print("STEP 1: Dataset Preprocessing")
+        print("STEP 1: Dataset Preprocessing + Captioning")
         print("="*60)
 
         preprocess_result = preprocess_dataset(
             input_dir=raw_dataset_path,
-            output_dir=clean_dataset_path
+            output_dir=clean_dataset_path,
+            trigger_word=config.trigger_word  # trigger_word 전달
         )
         print(f"Preprocessing result: {preprocess_result}")
 
@@ -403,10 +410,44 @@ def train_with_preprocessing(
                 phase="preprocessing",
                 current_epoch=0,
                 total_epochs=0,
-                message="데이터셋 전처리 완료"
+                message="데이터셋 전처리 및 캡셔닝 완료"
             )
     else:
-        print(f"Skipping preprocessing, using: {clean_dataset_path}")
+        # 전처리 스킵, 캡셔닝만 수행 (필수)
+        from .preprocess import caption_only_dataset
+
+        # 캡셔닝 시작 콜백
+        if callback:
+            callback(
+                status="PREPROCESSING",
+                phase="preprocessing",
+                current_epoch=0,
+                total_epochs=0,
+                message="이미지 캡셔닝 중..."
+            )
+
+        print("\n" + "="*60)
+        print("STEP 1: Captioning Only (Preprocessing Skipped)")
+        print("="*60)
+
+        caption_result = caption_only_dataset(
+            input_dir=raw_dataset_path,
+            trigger_word=config.trigger_word
+        )
+        print(f"Captioning result: {caption_result}")
+
+        # 전처리 스킵하므로 원본 이미지 디렉토리를 학습에 사용
+        clean_dataset_path = raw_dataset_path
+
+        # 캡셔닝 완료 콜백
+        if callback:
+            callback(
+                status="PREPROCESSING",
+                phase="preprocessing",
+                current_epoch=0,
+                total_epochs=0,
+                message="이미지 캡셔닝 완료"
+            )
 
     # 2. 학습
     print("\n" + "="*60)

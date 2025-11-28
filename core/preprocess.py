@@ -21,9 +21,10 @@ from .config import PreprocessConfig
 class ImagePreprocessor:
     """이미지 전처리 클래스"""
 
-    def __init__(self, config: PreprocessConfig = None, enable_captioning: bool = True):
+    def __init__(self, config: PreprocessConfig = None, enable_captioning: bool = True, trigger_word: str = None):
         self.config = config or PreprocessConfig()
         self.enable_captioning = enable_captioning
+        self.trigger_word = trigger_word
 
         # OCR 초기화
         print("Initializing OCR...")
@@ -134,7 +135,8 @@ class ImagePreprocessor:
     def generate_caption(self, image_pil):
         """BLIP으로 이미지 캡션 생성"""
         if not self.enable_captioning:
-            return "sks"
+            # 캡셔닝 비활성화 시 trigger_word만 반환 (None이면 빈 문자열)
+            return self.trigger_word if self.trigger_word else ""
 
         with torch.no_grad():
             inputs = self.caption_processor(image_pil, return_tensors="pt")
@@ -149,8 +151,12 @@ class ImagePreprocessor:
 
             caption = self.caption_processor.decode(out[0], skip_special_tokens=True)
 
-        # Trigger word 추가
-        full_caption = f"sks, {caption}"
+        # Trigger word 추가 (None이 아닐 경우에만)
+        if self.trigger_word:
+            full_caption = f"{self.trigger_word}, {caption}"
+        else:
+            full_caption = caption
+
         return full_caption
 
     def crop_and_resize(self, image, bbox, target_size=None):
@@ -284,12 +290,124 @@ class ImagePreprocessor:
         }
 
 
+def caption_only_dataset(
+    input_dir: str,
+    trigger_word: str = None
+):
+    """
+    캡셔닝만 수행 (전처리 없이 원본 이미지에 캡션 생성)
+
+    Args:
+        input_dir: 원본 이미지 폴더
+        trigger_word: 트리거 워드 (None이면 캡션에 트리거 워드 추가 안 함)
+
+    Returns:
+        dict: 캡셔닝 결과 정보
+    """
+    from pathlib import Path
+    from tqdm import tqdm
+    import torch
+    from transformers import BlipProcessor, BlipForConditionalGeneration
+    from PIL import Image
+
+    input_path = Path(input_dir)
+
+    # 이미지 파일 찾기
+    image_files = (
+        list(input_path.glob("*.png")) +
+        list(input_path.glob("*.jpg")) +
+        list(input_path.glob("*.jpeg")) +
+        list(input_path.glob("*.webp"))
+    )
+
+    if len(image_files) == 0:
+        raise ValueError(f"No images found in {input_dir}")
+
+    print(f"Found {len(image_files)} images for captioning")
+
+    # BLIP 캡셔닝 모델 초기화
+    print("Initializing BLIP captioning model...")
+    caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    caption_model = BlipForConditionalGeneration.from_pretrained(
+        "Salesforce/blip-image-captioning-base",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    if torch.cuda.is_available():
+        caption_model.to("cuda")
+    caption_model.eval()
+    print("BLIP model loaded!")
+
+    success_count = 0
+    failed_files = []
+    sample_captions = []
+
+    for img_file in tqdm(image_files, desc="Captioning images"):
+        try:
+            # 이미지 로드
+            image_pil = Image.open(img_file).convert("RGB")
+
+            # 캡션 생성
+            with torch.no_grad():
+                inputs = caption_processor(image_pil, return_tensors="pt")
+                if torch.cuda.is_available():
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                out = caption_model.generate(
+                    **inputs,
+                    max_length=50,
+                    num_beams=3
+                )
+
+                caption = caption_processor.decode(out[0], skip_special_tokens=True)
+
+            # Trigger word 추가 (None이 아닐 경우에만)
+            if trigger_word:
+                full_caption = f"{trigger_word}, {caption}"
+            else:
+                full_caption = caption
+
+            # 캡션을 .txt 파일로 저장
+            caption_path = img_file.with_suffix('.txt')
+            with open(caption_path, 'w', encoding='utf-8') as f:
+                f.write(full_caption)
+
+            success_count += 1
+
+            # 처음 3개 캡션 샘플 저장
+            if len(sample_captions) < 3:
+                sample_captions.append((img_file.name, full_caption))
+
+        except Exception as e:
+            print(f"\nError captioning {img_file.name}: {e}")
+            failed_files.append(img_file.name)
+            continue
+
+    print(f"\nCaptioning completed: {success_count}/{len(image_files)} successful")
+
+    # 샘플 캡션 출력
+    if sample_captions:
+        print(f"\nSample captions:")
+        for filename, caption in sample_captions:
+            print(f"  {filename}: {caption}")
+
+    if failed_files:
+        print(f"Failed files: {', '.join(failed_files)}")
+
+    return {
+        "total": len(image_files),
+        "success": success_count,
+        "failed": len(failed_files),
+        "output_dir": str(input_dir)
+    }
+
+
 def preprocess_dataset(
     input_dir: str,
     output_dir: str,
     enable_text_removal: bool = True,
     enable_captioning: bool = True,
-    image_size: int = 512
+    image_size: int = 512,
+    trigger_word: str = None
 ):
     """
     데이터셋 전처리 함수 (Modal API용)
@@ -300,6 +418,7 @@ def preprocess_dataset(
         enable_text_removal: 텍스트 제거 활성화
         enable_captioning: BLIP 자동 캡셔닝 활성화
         image_size: 출력 이미지 크기
+        trigger_word: 트리거 워드 (None이면 캡션에 트리거 워드 추가 안 함)
 
     Returns:
         dict: 전처리 결과 정보
@@ -311,7 +430,7 @@ def preprocess_dataset(
         image_size=image_size
     )
 
-    preprocessor = ImagePreprocessor(config, enable_captioning=enable_captioning)
+    preprocessor = ImagePreprocessor(config, enable_captioning=enable_captioning, trigger_word=trigger_word)
     return preprocessor.process_batch()
 
 

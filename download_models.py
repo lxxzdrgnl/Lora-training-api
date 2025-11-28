@@ -35,51 +35,75 @@ image = (
 def download_base_models():
     """
     베이스 모델 다운로드
-    - Anything V4.5 (Stable Diffusion 모델)
-    - 이미지 생성에 사용되는 기본 모델
+    - 여러 Stable Diffusion 모델을 다운로드
+    - 이미지 생성에 사용되는 기본 모델들
     """
     from diffusers import StableDiffusionPipeline
     import torch
 
     print("📥 베이스 모델 다운로드 시작...")
 
-    # Anything V4.5 모델 다운로드
-    model_id = "andite/anything-v4.0"  # 또는 "stablediffusionapi/anything-v5"
-    model_path = "/models/anything-v4.5"
-
-    print(f"📦 모델 ID: {model_id}")
-    print(f"💾 저장 경로: {model_path}")
-
-    try:
-        # 모델 다운로드 및 저장
-        pipeline = StableDiffusionPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-            safety_checker=None,
-            requires_safety_checker=False
-        )
-
-        # 볼륨에 저장
-        pipeline.save_pretrained(model_path)
-
-        # 볼륨 커밋 (변경사항 저장)
-        volume.commit()
-
-        print("✅ 베이스 모델 다운로드 완료!")
-        print(f"📂 모델이 /models/anything-v4.5에 저장되었습니다.")
-
-        return {
-            "status": "SUCCESS",
-            "model_path": model_path,
-            "model_id": model_id
+    # 다운로드할 모델 리스트
+    models = [
+        {
+            "id": "stablediffusionapi/anything-v5",
+            "name": "anything-v5"
+        },
+        {
+            "id": "Lykon/AnyLoRA",
+            "name": "anylora"
         }
+    ]
 
-    except Exception as e:
-        print(f"❌ 모델 다운로드 실패: {e}")
-        return {
-            "status": "FAIL",
-            "error": str(e)
-        }
+    results = []
+
+    for model_info in models:
+        model_id = model_info["id"]
+        model_name = model_info["name"]
+        model_path = f"/models/{model_name}"
+
+        print(f"\n{'='*60}")
+        print(f"📦 모델 ID: {model_id}")
+        print(f"💾 저장 경로: {model_path}")
+
+        try:
+            # 모델 다운로드 및 저장
+            pipeline = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                safety_checker=None,
+                requires_safety_checker=False
+            )
+
+            # 볼륨에 저장
+            pipeline.save_pretrained(model_path)
+
+            print(f"✅ {model_name} 다운로드 완료!")
+
+            results.append({
+                "status": "SUCCESS",
+                "model_id": model_id,
+                "model_name": model_name,
+                "model_path": model_path
+            })
+
+        except Exception as e:
+            print(f"❌ {model_name} 다운로드 실패: {e}")
+            results.append({
+                "status": "FAIL",
+                "model_id": model_id,
+                "model_name": model_name,
+                "error": str(e)
+            })
+
+    # 볼륨 커밋 (변경사항 저장)
+    volume.commit()
+
+    print(f"\n{'='*60}")
+    print(f"✅ 모든 모델 다운로드 작업 완료!")
+    print(f"성공: {sum(1 for r in results if r['status'] == 'SUCCESS')}/{len(results)}")
+
+    return results
 
 
 @app.function(

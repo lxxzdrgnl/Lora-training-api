@@ -41,6 +41,7 @@ def download_base_model_to_image():
 # 패키지와 베이스 모델은 거의 변경되지 않으므로 한 번 빌드되면 계속 재사용됨
 base_image = (
     modal.Image.debian_slim(python_version="3.11")
+    .env({"CACHE_BUSTER": "1"})
     .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
     .pip_install(
         "torch>=2.0.0",
@@ -75,52 +76,11 @@ image = base_image.add_local_dir(
     remote_path="/root/core"
 )
 
-# Modal Volume 설정 (모델 캐싱용)
-volume = modal.Volume.from_name("lora-models", create_if_missing=True)
-BASE_MODEL_PATH = "/base_models"
+# Modal Volume 설정 (학습 데이터 캐싱용)
 CACHE_DIR = "/cache"
 
 # AWS Secrets 설정
 secrets = modal.Secret.from_name("lora-secrets")
-
-# 베이스 모델 다운로드 함수 (앱 시작 시 한 번만 실행)
-@app.function(
-    image=image,
-    volumes={BASE_MODEL_PATH: volume},
-    timeout=3600,  # 1시간
-    secrets=[secrets]
-)
-def download_base_model():
-    """
-    베이스 Stable Diffusion 모델을 다운로드하여 캐싱합니다.
-    """
-    from diffusers import StableDiffusionPipeline
-    import torch
-
-    model_id = "stablediffusionapi/anything-v5"
-    local_path = f"{BASE_MODEL_PATH}/anything-v5"
-
-    print(f"Downloading base model: {model_id}")
-
-    # 이미 다운로드된 경우 스킵
-    if os.path.exists(local_path):
-        print(f"✅ Base model already cached at {local_path}")
-        return local_path
-
-    # 다운로드
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        safety_checker=None
-    )
-
-    # 저장
-    pipe.save_pretrained(local_path)
-    volume.commit()
-
-    print(f"✅ Base model downloaded to {local_path}")
-    return local_path
-
 
 # LoRA 학습 클래스 (GPU A10G 사용)
 @app.cls(
@@ -152,14 +112,7 @@ class LoraTrainer:
         from diffusers import StableDiffusionPipeline
         import torch
 
-        print("🚀 Initializing LoRA Trainer...")
-
-        # 베이스 모델 경로
-        self.base_model_path = "/base_models/anything-v5"
-
-        if not os.path.exists(self.base_model_path):
-            print("⚠️ Base model not found in image, using HuggingFace")
-            self.base_model_path = "stablediffusionapi/anything-v5"
+        self.base_model_path = "stablediffusionapi/anything-v5"
 
         print(f"📦 Loading base model from: {self.base_model_path}")
 
@@ -179,22 +132,36 @@ class LoraTrainer:
         self,
         user_id: str,
         model_id: int,
+        job_id: int,
         model_name: str,
         training_image_urls: list[str],
-        callback_url: str = None
+        callback_url: str = None,
+        trigger_word: str = None,
+        epochs: int = 250,
+        learning_rate: float = 2e-5,
+        lora_rank: int = 32,
+        base_model: str = "stablediffusionapi/anything-v5",
+        skip_preprocessing: bool = False
     ):
         """
-        LoRA 학습을 실행합니다.
+        Execute LoRA training.
 
         Args:
-            user_id: 사용자 ID
-            model_id: 모델 ID
-            model_name: 모델 이름
-            training_image_urls: S3 presigned URL 리스트
-            callback_url: 완료 시 호출할 콜백 URL
+            user_id: User ID
+            model_id: Model ID
+            job_id: Training job ID (unique identifier)
+            model_name: Model name
+            training_image_urls: S3 presigned URL list
+            callback_url: Callback URL when training completes
+            trigger_word: Trigger word (None = no trigger word in captions)
+            epochs: Number of training epochs (default: 250)
+            learning_rate: Learning rate (default: 2e-5)
+            lora_rank: LoRA Rank (default: 32)
+            base_model: Base model (default: stablediffusionapi/anything-v5)
+            skip_preprocessing: Skip preprocessing (captioning is always performed)
 
         Returns:
-            dict: 학습 결과
+            dict: Training result
         """
         from core.config import TrainingConfig
         from core.train import train_with_preprocessing
@@ -203,17 +170,18 @@ class LoraTrainer:
         import boto3
         import time
 
-        print(f"Starting training for user: {user_id}, model: {model_name}")
+        print(f"Starting training for job: {job_id}, model: {model_name}")
         print(f"Number of training images: {len(training_image_urls)}")
 
-        # 진행률 콜백 함수
+        # Progress callback function
         def send_progress_callback(status, message):
-            """백엔드로 진행률 전송"""
+            """Send progress to backend"""
             if callback_url:
                 try:
                     progress_data = {
                         "userId": user_id,
                         "modelId": model_id,
+                        "jobId": job_id,
                         "status": status,
                         "message": message
                     }
@@ -222,15 +190,15 @@ class LoraTrainer:
                 except Exception as e:
                     print(f"⚠️ Failed to send progress: {e}")
 
-        # 1. 서버 로드 중
+        # 1. Loading server
         send_progress_callback("LOADING", "Loading server")
         time.sleep(0.5)
 
-        # 2. 이미지 전처리 중 (다운로드)
-        send_progress_callback("PREPROCESSING", "Preprocessing images")
+        # 2. Downloading images from S3
+        send_progress_callback("DOWNLOADING", "Downloading training images from S3")
 
-        # S3 이미지 다운로드
-        temp_dataset_path = f"{CACHE_DIR}/dataset_{user_id}_{model_name}"
+        # Download training images from S3 (jobId 기반 폴더)
+        temp_dataset_path = f"{CACHE_DIR}/training-{job_id}/dataset"
         os.makedirs(temp_dataset_path, exist_ok=True)
 
         print("Downloading training images from S3...")
@@ -248,33 +216,53 @@ class LoraTrainer:
                     f.write(chunk)
 
         print(f"Downloaded {len(training_image_urls)} images")
+        send_progress_callback("DOWNLOADING_COMPLETE", f"Downloaded {len(training_image_urls)} images")
 
-        # 학습 설정
-        output_dir = f"{CACHE_DIR}/models/{user_id}/{model_name}"
+        # Training configuration (jobId 기반 경로)
+        output_dir = f"{CACHE_DIR}/training-{job_id}/model"
+        clean_dataset_path = f"{CACHE_DIR}/training-{job_id}/dataset_clean"
 
         config = TrainingConfig(
             raw_dataset_path=temp_dataset_path,
+            clean_dataset_path=clean_dataset_path,
             output_dir=output_dir,
-            model_id=self.base_model_path
+            model_id=base_model,
+            num_epochs=epochs,
+            learning_rate=learning_rate,
+            lora_r=lora_rank,
+            trigger_word=trigger_word
         )
 
-        # 학습 콜백 함수 (에포크별 진행률)
+        # Training callback function (detailed progress tracking)
         def training_callback(status, phase, current_epoch, total_epochs, message):
-            """학습 진행률 콜백"""
-            if phase == "training" and current_epoch > 0:
-                progress_message = f"Training {current_epoch}/{total_epochs}"
-                send_progress_callback("TRAINING", progress_message)
+            """Training progress callback - handles all phases"""
+            print(f"Training callback: phase={phase}, epoch={current_epoch}/{total_epochs}, message={message}")
 
-        # 학습 실행
+            if phase == "preprocessing":
+                # 전처리 및 캡셔닝 단계
+                if "완료" in message or "complete" in message.lower():
+                    send_progress_callback("CAPTIONING_COMPLETE", message)
+                else:
+                    send_progress_callback("PREPROCESSING", message)
+            elif phase == "training":
+                # 학습 단계
+                if current_epoch > 0:
+                    progress_message = f"Training {current_epoch}/{total_epochs}"
+                    send_progress_callback("TRAINING", progress_message)
+            else:
+                # 기타 단계
+                send_progress_callback(status, message)
+
+        # Execute training
         try:
-            # 3. 학습 시작
-            send_progress_callback("TRAINING", "Training 0/{}".format(config.num_epochs))
+            # 3. Start training
+            send_progress_callback("TRAINING", "Starting training pipeline...")
 
             train_result = train_with_preprocessing(
                 raw_dataset_path=temp_dataset_path,
                 output_dir=output_dir,
                 config=config,
-                skip_preprocessing=False,
+                skip_preprocessing=skip_preprocessing,  # 동적 파라미터
                 callback=training_callback
             )
 
@@ -302,8 +290,8 @@ class LoraTrainer:
             s3_client = boto3.client('s3')
             bucket_name = os.environ.get("AWS_S3_MODELS_BUCKET", "lora-models-bucket")
 
-            # S3 키: model-{modelId}/{modelName}.safetensors
-            s3_model_key = f"model-{model_id}/{model_name}.safetensors"
+            # S3 키: training-{jobId}/{modelName}.safetensors (고유성 보장)
+            s3_model_key = f"training-{job_id}/{model_name}.safetensors"
             s3_client.upload_file(
                 model_file_path,
                 bucket_name,
@@ -331,9 +319,9 @@ class LoraTrainer:
                 except Exception as e:
                     print(f"❌ Callback failed: {e}")
 
-            # 임시 파일 정리
-            shutil.rmtree(temp_dataset_path, ignore_errors=True)
-            shutil.rmtree(output_dir, ignore_errors=True)
+            # 임시 파일 정리 (전체 training-{jobId} 폴더 삭제)
+            training_folder = f"{CACHE_DIR}/training-{job_id}"
+            shutil.rmtree(training_folder, ignore_errors=True)
 
             return {
                 "status": "SUCCESS",
@@ -343,26 +331,32 @@ class LoraTrainer:
             }
 
         except Exception as e:
+            import traceback
+            error_traceback = traceback.format_exc()
             print(f"❌ Training failed: {e}")
+            print(f"Traceback:\n{error_traceback}")
 
-            # 실패 콜백
+            # 실패 콜백 (즉시 전송)
             if callback_url:
                 try:
                     callback_data = {
                         "userId": user_id,
                         "modelId": model_id,
+                        "jobId": job_id,
                         "modelName": model_name,
                         "status": "FAIL",
-                        "error": str(e)
+                        "error": str(e),
+                        "traceback": error_traceback[:1000]  # 최대 1000자까지만 전송
                     }
-                    requests.post(callback_url, json=callback_data, timeout=10)
-                    print(f"❌ Failure callback sent to backend for model {model_id}.")
+                    response = requests.post(callback_url, json=callback_data, timeout=10)
+                    response.raise_for_status()
+                    print(f"✅ Failure callback sent to backend for job {job_id}.")
                 except Exception as cb_e:
                     print(f"⚠️ Failed to send failure callback: {cb_e}")
 
-            # 정리
-            shutil.rmtree(temp_dataset_path, ignore_errors=True)
-            shutil.rmtree(output_dir, ignore_errors=True)
+            # 정리 (실패 시에도 임시 폴더 삭제)
+            training_folder = f"{CACHE_DIR}/training-{job_id}"
+            shutil.rmtree(training_folder, ignore_errors=True)
 
             raise
 
@@ -378,6 +372,7 @@ class LoraTrainer:
     secrets=[secrets],
     memory=16384,  # 16GB RAM
     enable_memory_snapshot=True,  # 메모리 스냅샷 활성화 - 부팅 시간 획기적 단축!
+    scaledown_window=2,  # 2초 후 종료 (최소 설정값)
 )
 class ImageGenerator:
     """
@@ -394,7 +389,7 @@ class ImageGenerator:
         컨테이너 시작 시 베이스 모델을 메모리에 로드합니다.
         메모리 스냅샷이 활성화되어 있어 이 초기화는 한 번만 수행됩니다.
         """
-        from diffusers import StableDiffusionPipeline
+        from diffusers import StableDiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
         import torch
 
         print("🚀 Initializing Image Generator...")
@@ -408,7 +403,7 @@ class ImageGenerator:
 
         print(f"📦 Loading base model from: {self.base_model_path}")
 
-        # 파이프라인 로드 (메모리 스냅샷에 포함됨)
+        # 파이프라인 로드 (원본 VAE 사용 - 로컬 학습 모델 호환성)
         self.pipe = StableDiffusionPipeline.from_pretrained(
             self.base_model_path,
             torch_dtype=torch.float16,
@@ -416,7 +411,7 @@ class ImageGenerator:
         )
         self.pipe.to("cuda")
 
-        print("✅ Base model loaded and ready!")
+        print("✅ Base model loaded with original VAE and scheduler!")
         print("💾 Memory snapshot will be created after this initialization")
 
     @modal.method()
@@ -431,8 +426,10 @@ class ImageGenerator:
         num_images: int = 1,
         steps: int = 40,
         guidance_scale: float = 7.5,
+        lora_scale: float = 1.0,
         seed: int = None,
-        callback_url: str = None
+        callback_url: str = None,
+        base_model: str = "stablediffusionapi/anything-v5"
     ):
         """
         이미지 생성을 실행합니다.
@@ -447,8 +444,10 @@ class ImageGenerator:
             num_images: 생성할 이미지 수
             steps: 추론 스텝
             guidance_scale: CFG scale
+            lora_scale: LoRA 강도
             seed: 랜덤 시드
             callback_url: 완료 시 콜백 URL
+            base_model: 베이스 모델 ID (기본: stablediffusionapi/anything-v5)
 
         Returns:
             list: S3 키 리스트
@@ -526,13 +525,14 @@ class ImageGenerator:
         os.makedirs(output_dir, exist_ok=True)
 
         config = InferenceConfig(
-            model_id=self.base_model_path,
+            model_id=base_model,
             lora_path=temp_lora_path,
             prompt=prompt,
             negative_prompt=negative_prompt,
             num_images=num_images,
             steps=steps,
             guidance_scale=guidance_scale,
+            lora_scale=lora_scale,
             seed=seed,
             output_dir=output_dir
         )
@@ -564,6 +564,26 @@ class ImageGenerator:
                     print(f"📊 Progress sent to backend: {message} ({current_step}/{total_steps})")
                 except Exception as e:
                     print(f"⚠️ Failed to send progress: {e}")
+
+        # Reze 모델 특별 처리 (0/Reze.safetensors)
+        is_reze_model = "0/Reze.safetensors" in lora_model_url
+        print(f"🔍 Model: {'Reze (원본 VAE)' if is_reze_model else '일반 모델 (외부 VAE)'}")
+
+        # VAE 동적 교체
+        if is_reze_model:
+            # Reze 모델: 원본 VAE 유지
+            print("✅ Using original VAE for Reze model")
+        else:
+            # 나머지 모델: 외부 VAE 사용
+            print("🔧 Loading external VAE...")
+            from diffusers import AutoencoderKL
+            import torch
+            vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sd-vae-ft-mse",
+                torch_dtype=torch.float16
+            ).to("cuda")
+            self.pipe.vae = vae
+            print("✅ External VAE loaded")
 
         # 이미지 생성
         try:
@@ -692,10 +712,18 @@ def fastapi_app():
     # Pydantic 모델
     class TrainRequest(BaseModel):
         user_id: str = Field(..., description="사용자 ID")
-        model_id: int = Field(..., description="모델 ID")
+        model_id: Optional[int] = Field(None, description="모델 ID (학습 완료 후 생성)")
+        job_id: int = Field(..., description="학습 작업 ID (고유 식별자)")
         model_name: str = Field(..., description="모델 이름")
         training_image_urls: List[str] = Field(..., description="S3 학습 이미지 URL 리스트")
         callback_url: Optional[str] = Field(None, description="학습 완료 시 콜백 URL")
+        # 학습 파라미터 (선택적)
+        trigger_word: Optional[str] = Field(None, description="트리거 워드")
+        epochs: Optional[int] = Field(250, description="학습 에포크 수")
+        learning_rate: Optional[float] = Field(2e-5, description="학습률")
+        lora_rank: Optional[int] = Field(32, description="LoRA Rank")
+        base_model: Optional[str] = Field("stablediffusionapi/anything-v5", description="베이스 모델")
+        skip_preprocessing: Optional[bool] = Field(False, description="전처리 스킵 여부 (캡셔닝은 항상 수행)")
 
     class GenerateRequest(BaseModel):
         user_id: str = Field(..., description="사용자 ID")
@@ -707,8 +735,10 @@ def fastapi_app():
         num_images: int = Field(1, description="생성할 이미지 수")
         steps: int = Field(40, description="추론 스텝")
         guidance_scale: float = Field(7.5, description="CFG scale")
+        lora_scale: float = Field(1.0, description="LoRA 강도")
         seed: Optional[int] = Field(None, description="랜덤 시드")
         callback_url: Optional[str] = Field(None, description="완료 시 콜백 URL")
+        base_model: Optional[str] = Field("stablediffusionapi/anything-v5", description="베이스 모델 ID")
 
     class MessageResponse(BaseModel):
         message: str
@@ -727,12 +757,19 @@ def fastapi_app():
             trainer.train_lora.spawn(
                 user_id=req.user_id,
                 model_id=req.model_id,
+                job_id=req.job_id,
                 model_name=req.model_name,
                 training_image_urls=req.training_image_urls,
-                callback_url=req.callback_url
+                callback_url=req.callback_url,
+                trigger_word=req.trigger_word,
+                epochs=req.epochs,
+                learning_rate=req.learning_rate,
+                lora_rank=req.lora_rank,
+                base_model=req.base_model,
+                skip_preprocessing=req.skip_preprocessing
             )
 
-            return {"message": "Training started on Modal GPU (A10G)"}
+            return {"message": f"Training started on Modal GPU (A10G) for job {req.job_id}"}
 
         except Exception as e:
             return JSONResponse(
@@ -756,8 +793,10 @@ def fastapi_app():
                 num_images=req.num_images,
                 steps=req.steps,
                 guidance_scale=req.guidance_scale,
+                lora_scale=req.lora_scale,
                 seed=req.seed,
-                callback_url=req.callback_url
+                callback_url=req.callback_url,
+                base_model=req.base_model
             )
 
             return {"message": "Image generation started on Modal GPU (T4)", "call_id": call.object_id}
@@ -807,19 +846,3 @@ def fastapi_app():
         return {"status": "healthy"}
 
     return web_app
-
-
-# CLI 명령어
-@app.local_entrypoint()
-def main():
-    """
-    로컬에서 Modal 함수 테스트
-    """
-    print("Starting Modal deployment...")
-
-    # 베이스 모델 다운로드 (최초 1회)
-    print("Downloading base model...")
-    download_base_model.remote()
-
-    print("✅ Modal deployment ready!")
-    print("Deploy with: modal deploy modal_app.py")

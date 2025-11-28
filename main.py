@@ -193,6 +193,7 @@ class TrainRequest(BaseModel):
     output_dir: Optional[str] = Field(None, description="학습된 모델이 저장될 경로 (자동 생성됨)")
     skip_preprocessing: bool = Field(False, description="전처리 과정 스킵 여부")
     callback_url: Optional[str] = Field(None, description="학습 완료 시 호출할 Spring Boot API URL")
+    base_model: str = Field("stablediffusionapi/anything-v5", description="베이스 모델 ID (기본: stablediffusionapi/anything-v5)")
 
 class GenerateRequest(BaseModel):
     user_id: Optional[str] = Field(None, description="사용자 ID (S3 경로 생성용)")
@@ -204,6 +205,7 @@ class GenerateRequest(BaseModel):
     steps: int = Field(40, description="이미지 생성 스텝 수")
     guidance_scale: float = Field(7.5, description="프롬프트 충실도 (CFG Scale)")
     seed: Optional[int] = Field(None, description="재현성을 위한 랜덤 시드")
+    base_model: str = Field("stablediffusionapi/anything-v5", description="베이스 모델 ID (기본: stablediffusionapi/anything-v5)")
 
 # 응답 모델
 class MessageResponse(BaseModel):
@@ -280,7 +282,8 @@ def run_training_task(req: TrainRequest):
 
         config = TrainingConfig(
             raw_dataset_path=raw_dataset_path,
-            output_dir=output_dir
+            output_dir=output_dir,
+            model_id=req.base_model
         )
         train_with_preprocessing(
             raw_dataset_path=raw_dataset_path,
@@ -406,7 +409,8 @@ def run_generation_task(req: GenerateRequest, base_url: str, user_id: str = None
             num_images=req.num_images,
             steps=req.steps,
             guidance_scale=req.guidance_scale,
-            seed=req.seed
+            seed=req.seed,
+            model_id=req.base_model
         )
 
         generated_files = generate_images(

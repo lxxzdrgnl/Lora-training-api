@@ -61,13 +61,15 @@ def convert_peft_to_webui(peft_state_dict):
     return webui_state_dict
 
 
-def save_lora_as_webui(unet_model, save_path):
+def save_lora_as_webui(unet_model, save_path, lora_alpha=64, lora_rank=32):
     """
     PEFT UNet 모델에서 LoRA 가중치를 WebUI 형식으로 저장
 
     Args:
         unet_model: PEFT가 적용된 UNet 모델
         save_path: 저장할 .safetensors 파일 경로
+        lora_alpha: LoRA alpha 값 (스케일링)
+        lora_rank: LoRA rank 값
     """
     # LoRA 가중치만 추출
     peft_state_dict = {k: v.cpu() for k, v in unet_model.state_dict().items() if 'lora' in k}
@@ -75,11 +77,24 @@ def save_lora_as_webui(unet_model, save_path):
     # WebUI 형식으로 변환
     webui_state_dict = convert_peft_to_webui(peft_state_dict)
 
+    # 메타데이터에 alpha 값 추가 (각 LoRA 레이어마다)
+    # Civitai/WebUI 형식은 이런 식으로 alpha를 저장함
+    metadata = {}
+    for key in webui_state_dict.keys():
+        if '.lora_up.weight' in key or '.lora_down.weight' in key:
+            # 레이어 이름 추출
+            base_key = key.rsplit('.', 2)[0]  # ".lora_up.weight" 또는 ".lora_down.weight" 제거
+            alpha_key = f"{base_key}.alpha"
+            if alpha_key not in webui_state_dict:
+                # alpha 값을 tensor로 저장
+                webui_state_dict[alpha_key] = torch.tensor(lora_alpha, dtype=torch.float32)
+
     # safetensors로 저장
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_file(webui_state_dict, save_path)
 
     print(f"✅ Saved {len(webui_state_dict)} LoRA weights in WebUI format")
+    print(f"   Alpha: {lora_alpha}, Rank: {lora_rank}")
     print(f"   File: {save_path}")
 
     return save_path

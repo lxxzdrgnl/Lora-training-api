@@ -25,15 +25,36 @@ def load_pipeline(model_id: str, lora_path: str, device: str):
     Returns:
         StableDiffusionPipeline: 로드된 파이프라인
     """
-    # Modal 이미지에 포함된 베이스 모델 사용
-    # /base_models/anything-v5 경로에 이미지 빌드 시 다운로드됨
-    if os.path.exists("/base_models/anything-v5"):
-        base_model_path = "/base_models/anything-v5"
-        print(f"\n✅ Using pre-cached base model from image: {base_model_path}")
+    # Modal Volume 캐싱 로직
+    # /cache/base_models/{model_id}/ 경로에 캐싱
+    cache_base = "/cache/base_models"
+
+    # 모델 ID를 파일시스템에 안전한 이름으로 변환 (/ -> --)
+    safe_model_id = model_id.replace("/", "--")
+    cached_model_path = os.path.join(cache_base, safe_model_id)
+
+    # 캐시된 모델 확인
+    if os.path.exists(cached_model_path) and os.path.exists(os.path.join(cached_model_path, "model_index.json")):
+        base_model_path = cached_model_path
+        print(f"\n✅ Using cached base model from volume: {base_model_path}")
     else:
-        # 로컬 환경에서는 HuggingFace Hub에서 다운로드
-        base_model_path = model_id
+        # 캐시가 없으면 HuggingFace에서 다운로드 후 캐싱
         print(f"\n📥 Downloading base model from HuggingFace: {model_id}")
+        print(f"💾 Will cache to: {cached_model_path}")
+
+        # 임시로 HuggingFace에서 로드
+        temp_pipe = StableDiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            safety_checker=None
+        )
+
+        # Modal Volume에 저장
+        os.makedirs(cache_base, exist_ok=True)
+        temp_pipe.save_pretrained(cached_model_path)
+        print(f"✅ Base model cached successfully!")
+
+        base_model_path = cached_model_path
 
     print(f"Loading base model: {base_model_path}")
     pipe = StableDiffusionPipeline.from_pretrained(
@@ -44,25 +65,40 @@ def load_pipeline(model_id: str, lora_path: str, device: str):
 
     print(f"Loading LoRA weights: {lora_path}")
 
-    # LoRA 경로 확인 (디렉토리 또는 단일 .safetensors 파일)
-    if os.path.isfile(lora_path) and lora_path.endswith('.safetensors'):
+    # LoRA 경로 확인 및 형식 판단
+    if os.path.isdir(lora_path):
+        # 디렉토리인 경우: PEFT 형식 우선 시도 (adapter_model.safetensors + adapter_config.json)
+        adapter_config_path = os.path.join(lora_path, "adapter_config.json")
+        adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
+
+        if os.path.exists(adapter_config_path) and os.path.exists(adapter_model_path):
+            # PEFT 형식 발견 - 이것이 가장 정확함 (alpha, rank 정보 포함)
+            print(f"✅ Found PEFT format (adapter_model.safetensors + adapter_config.json)")
+            print(f"   This preserves lora_alpha and lora_r from training")
+            pipe.load_lora_weights(
+                lora_path,  # 디렉토리 전달
+                weight_name="adapter_model.safetensors"
+            )
+        else:
+            # PEFT 형식이 없으면 WebUI 형식 찾기
+            safetensors_files = [f for f in os.listdir(lora_path) if f.endswith('.safetensors')]
+            if not safetensors_files:
+                raise ValueError(f"No .safetensors file found in {lora_path}")
+            lora_file = safetensors_files[0]
+            print(f"Found WebUI format: {lora_file}")
+            pipe.load_lora_weights(
+                lora_path,
+                weight_name=lora_file
+            )
+    elif os.path.isfile(lora_path) and lora_path.endswith('.safetensors'):
         # 단일 safetensors 파일 (Civitai 다운로드 형식)
-        lora_file = lora_path
-        print(f"Found single LoRA file: {lora_file}")
-    elif os.path.isdir(lora_path):
-        # 디렉토리 내에서 safetensors 파일 찾기
-        safetensors_files = [f for f in os.listdir(lora_path) if f.endswith('.safetensors')]
-        if not safetensors_files:
-            raise ValueError(f"No .safetensors file found in {lora_path}")
-        lora_file = os.path.join(lora_path, safetensors_files[0])
-        print(f"Found LoRA file in directory: {safetensors_files[0]}")
+        print(f"Found single LoRA file (WebUI format): {lora_path}")
+        pipe.load_lora_weights(
+            os.path.dirname(lora_path),
+            weight_name=os.path.basename(lora_path)
+        )
     else:
         raise ValueError(f"Invalid LoRA path: {lora_path}")
-
-    # Diffusers의 load_lora_weights()로 WebUI 형식 직접 로드
-    # 이 메서드는 Civitai에서 다운받은 단일 safetensors 파일을 바로 로드할 수 있음
-    print(f"Loading LoRA with Diffusers (WebUI format support)...")
-    pipe.load_lora_weights(lora_file)
 
     # GPU로 이동
     pipe.to(device)
@@ -125,11 +161,12 @@ def generate_images(
     # 파이프라인 로드
     pipe = load_pipeline(config.model_id, config.lora_path, config.device)
 
-    # Trigger word 자동 추가
-    if not config.prompt.startswith(config.trigger_word):
-        full_prompt = f"{config.trigger_word}, {config.prompt}"
-    else:
-        full_prompt = config.prompt
+    # Trigger word 자동 추가 (사용자 요청으로 제거됨)
+    # if not config.prompt.startswith(config.trigger_word):
+    #     full_prompt = f"{config.trigger_word}, {config.prompt}"
+    # else:
+    #     full_prompt = config.prompt
+    full_prompt = config.prompt
 
     print("="*60)
     print(f"DEBUG: config.num_images = {config.num_images}")
@@ -188,7 +225,8 @@ def generate_images(
                 guidance_scale=config.guidance_scale,
                 generator=generator,
                 callback_on_step_end=step_callback if callback else None,
-                callback_on_step_end_tensor_inputs=["latents"]
+                callback_on_step_end_tensor_inputs=["latents"],
+                cross_attention_kwargs={"scale": config.lora_scale}  # LoRA 강도 적용
             ).images[0]
 
         # 파일명 생성

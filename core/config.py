@@ -18,7 +18,7 @@ class TrainingConfig:
 
     # LoRA
     lora_r: int = 32  # LoRA rank (표현력)
-    lora_alpha: int = 64  # rank × 2
+    lora_alpha: int = None  # rank 값과 동일하게 설정
     lora_dropout: float = 0.0  # 작은 데이터셋은 dropout 없음
     target_modules: list = None  # ["to_q", "to_v", "to_k", "to_out.0"]
 
@@ -36,12 +36,14 @@ class TrainingConfig:
     # 출력
     output_dir: str = "my_lora_model"
 
-    # 프롬프트 (BLIP 자동 캡셔닝 사용)
-    trigger_word: str = "sks"
+    # 프롬프트 (BLIP 자동 캡셔닝 사용, None이면 트리거 워드 없이 캡션만 사용)
+    trigger_word: str = None
 
     def __post_init__(self):
         if self.target_modules is None:
             self.target_modules = ["to_q", "to_v", "to_k", "to_out.0"]
+        if self.lora_alpha is None:
+            self.lora_alpha = self.lora_r
 
 
 @dataclass
@@ -57,6 +59,7 @@ class InferenceConfig:
     num_images: int = 3
     steps: int = 40
     guidance_scale: float = 6.5
+    lora_scale: float = 1.0  # LoRA 강도 (0.0~2.0)
     seed: int = None
 
     # 출력
