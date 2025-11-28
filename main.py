@@ -130,19 +130,19 @@ def upload_to_s3(local_file_path: str, s3_key: str, bucket_name: str = "lora-tra
         print(f"❌ S3 upload failed: {e}")
         raise
 
-def download_training_images(s3_urls: List[str]) -> str:
+def download_training_images(s3_urls: List[str], job_id: int) -> str:
     """
     여러 S3 URL에서 학습용 이미지들을 다운로드합니다.
 
     Args:
         s3_urls: S3 Presigned URL 리스트
+        job_id: 학습 작업 ID
 
     Returns:
-        데이터셋 경로 (temp/dataset_xxxxx)
+        데이터셋 경로 (temp/training-{job_id}/dataset)
     """
-    # temp 디렉토리 안에 고유한 데이터셋 폴더 생성
-    dataset_id = os.urandom(8).hex()
-    dataset_path = os.path.join("temp", f"dataset_{dataset_id}")
+    # jobId 기반 디렉토리 생성
+    dataset_path = os.path.join("temp", f"training-{job_id}", "dataset")
     os.makedirs(dataset_path, exist_ok=True)
 
     for idx, s3_url in enumerate(s3_urls):
@@ -187,6 +187,8 @@ generation_lock = Lock()
 # 요청 모델
 class TrainRequest(BaseModel):
     user_id: str = Field(..., description="사용자 ID")
+    model_id: Optional[int] = Field(None, description="모델 ID (학습 완료 후 생성)")
+    job_id: int = Field(..., description="학습 작업 ID (고유 식별자)")
     model_name: str = Field(..., description="모델 이름")
     training_image_urls: Optional[List[str]] = Field(None, description="S3에 업로드된 학습 이미지 URL 리스트")
     raw_dataset_path: Optional[str] = Field(None, description="원본 데이터셋 경로 (로컬 파일 사용 시)")
@@ -259,7 +261,7 @@ def run_training_task(req: TrainRequest):
         training_status["progress"]["total_epochs"] = total_epochs
         training_status["message"] = message
 
-    temp_dataset_path = None  # 임시 파일 경로 추적
+    temp_folder = None  # 전체 temp/training-{job_id} 폴더 추적
     model_file_path = None
     s3_key = None
 
@@ -271,14 +273,15 @@ def run_training_task(req: TrainRequest):
                 phase="downloading",
                 message="S3에서 학습 이미지 다운로드 중..."
             )
-            # temp/dataset_xxxxx에 다운로드
-            temp_dataset_path = download_training_images(req.training_image_urls)
+            # temp/training-{job_id}/dataset에 다운로드
+            temp_dataset_path = download_training_images(req.training_image_urls, req.job_id)
+            temp_folder = os.path.join("temp", f"training-{req.job_id}")
             raw_dataset_path = temp_dataset_path
         else:
             raw_dataset_path = req.raw_dataset_path or "./dataset"
 
-        # 출력 디렉토리 자동 생성 (models/{user_id}/{model_name})
-        output_dir = req.output_dir or f"models/{req.user_id}/{req.model_name}"
+        # 출력 디렉토리 자동 생성 (temp/training-{job_id}/model)
+        output_dir = req.output_dir or os.path.join("temp", f"training-{req.job_id}", "model")
 
         config = TrainingConfig(
             raw_dataset_path=raw_dataset_path,
@@ -305,11 +308,11 @@ def run_training_task(req: TrainRequest):
         if not os.path.exists(model_file_path):
             raise FileNotFoundError(f"Model file not found: {model_file_path}")
 
-        # S3 키 생성 (models/{user_id}/{model_name}.safetensors)
-        s3_key = f"models/{req.user_id}/{req.model_name}.safetensors"
+        # S3 키 생성 (training-{job_id}/{model_name}.safetensors)
+        s3_key = f"training-{req.job_id}/{req.model_name}.safetensors"
 
         # S3 업로드
-        upload_to_s3(model_file_path, s3_key)
+        upload_to_s3(model_file_path, s3_key, bucket_name="lora-models-bucket")
 
         # 파일 크기 계산
         file_size = os.path.getsize(model_file_path)
@@ -327,8 +330,10 @@ def run_training_task(req: TrainRequest):
             try:
                 callback_data = {
                     "userId": req.user_id,
+                    "modelId": req.model_id,
+                    "jobId": req.job_id,
                     "modelName": req.model_name,
-                    "s3Key": s3_key,
+                    "s3ModelKey": s3_key,
                     "fileSize": file_size,
                     "status": "SUCCESS"
                 }
@@ -352,6 +357,8 @@ def run_training_task(req: TrainRequest):
             try:
                 callback_data = {
                     "userId": req.user_id,
+                    "modelId": req.model_id,
+                    "jobId": req.job_id,
                     "modelName": req.model_name,
                     "status": "FAIL",
                     "error": str(e)
@@ -361,10 +368,11 @@ def run_training_task(req: TrainRequest):
                 pass
 
     finally:
-        # S3에서 다운로드한 임시 파일 정리
-        if temp_dataset_path and os.path.exists(temp_dataset_path):
+        # 전체 training-{job_id} 폴더 정리
+        if temp_folder and os.path.exists(temp_folder):
             try:
-                shutil.rmtree(temp_dataset_path)
+                shutil.rmtree(temp_folder)
+                print(f"✅ Temporary folder cleaned: {temp_folder}")
             except Exception as e:
                 print(f"임시 파일 정리 실패: {e}")
 

@@ -114,19 +114,21 @@ def load_images_with_captions(dataset_path: str, trigger_word: str = None):
     return image_caption_pairs
 
 
-def load_and_preprocess_image(img_path: str, device: str, size: int = 512):
+def load_and_preprocess_image(img_paths: list[str], device: str, size: int = 512):
     """이미지를 tensor로 변환"""
-    img = Image.open(img_path).convert("RGB").resize((size, size), Image.LANCZOS)
-    img_array = np.array(img).astype(np.float32) / 255.0
-    img_array = (img_array - 0.5) / 0.5  # normalize to [-1, 1]
-    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)
-    return img_tensor.to(device, dtype=torch.float16)
+    images = []
+    for img_path in img_paths:
+        img = Image.open(img_path).convert("RGB").resize((size, size), Image.LANCZOS)
+        img_array = np.array(img).astype(np.float32) / 255.0
+        img_array = (img_array - 0.5) / 0.5  # normalize to [-1, 1]
+        images.append(torch.from_numpy(img_array).permute(2, 0, 1))
+    return torch.stack(images).to(device, dtype=torch.float16)
 
 
-def encode_prompt(text_encoder, tokenizer, prompt_text: str, device: str):
+def encode_prompt(text_encoder, tokenizer, prompt_texts: list[str], device: str):
     """텍스트 프롬프트 인코딩"""
     text_input = tokenizer(
-        prompt_text,
+        prompt_texts,
         padding="max_length",
         max_length=tokenizer.model_max_length,
         truncation=True,
@@ -196,7 +198,7 @@ def train_lora(
         weight_decay=config.weight_decay
     )
 
-    total_steps = len(image_caption_pairs) * config.num_epochs // config.gradient_accumulation_steps
+    total_steps = (len(image_caption_pairs) // config.batch_size) * config.num_epochs // config.gradient_accumulation_steps
     warmup_steps = total_steps // 10
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -208,6 +210,7 @@ def train_lora(
     print(f"\nStarting training:")
     print(f"  Epochs: {config.num_epochs}")
     print(f"  Learning rate: {config.learning_rate}")
+    print(f"  Batch size: {config.batch_size}")
     print(f"  Total steps: {total_steps}")
 
     loss_history = []
@@ -225,8 +228,14 @@ def train_lora(
 
     for epoch in range(config.num_epochs):
         epoch_loss = 0
-        progress_bar = tqdm(image_caption_pairs, desc=f"Epoch {epoch+1}/{config.num_epochs}")
-        total_batches = len(image_caption_pairs)
+        
+        # 데이터셋을 배치로 묶기
+        batched_data = []
+        for i in range(0, len(image_caption_pairs), config.batch_size):
+            batched_data.append(image_caption_pairs[i:i + config.batch_size])
+
+        total_batches = len(batched_data)
+        progress_bar = tqdm(batched_data, desc=f"Epoch {epoch+1}/{config.num_epochs}")
 
         # 에포크 시작 시 콜백 호출
         if callback:
@@ -238,9 +247,12 @@ def train_lora(
                 message=f"Training {epoch + 1}/{config.num_epochs}"
             )
 
-        for batch_idx, (img_path, caption) in enumerate(progress_bar):
+        for batch_idx, batch in enumerate(progress_bar):
+            img_paths = [item[0] for item in batch]
+            captions = [item[1] for item in batch]
+
             # 이미지 로드
-            pixel_values = load_and_preprocess_image(img_path, config.device, config.image_size)
+            pixel_values = load_and_preprocess_image(img_paths, config.device, config.image_size)
 
             # VAE latent 변환
             with torch.no_grad():
@@ -249,7 +261,7 @@ def train_lora(
 
             # 프롬프트 인코딩 (각 이미지의 캡션 사용)
             encoder_hidden_states = encode_prompt(
-                text_encoder, tokenizer, caption, config.device
+                text_encoder, tokenizer, captions, config.device
             )
 
             # Noise 추가
@@ -290,7 +302,7 @@ def train_lora(
             loss.backward()
 
             # Gradient accumulation
-            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0 or (batch_idx + 1) == total_batches:
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -313,7 +325,7 @@ def train_lora(
             if global_step % 10 == 0:
                 torch.cuda.empty_cache()
 
-        avg_loss = epoch_loss / len(image_caption_pairs)
+        avg_loss = epoch_loss / total_batches
         print(f"Epoch {epoch+1} completed - Average Loss: {avg_loss:.4f}")
 
         # 50 에포크마다 체크포인트 저장

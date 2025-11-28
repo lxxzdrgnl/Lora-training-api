@@ -5,6 +5,7 @@ LoRA 변환 유틸리티 (PEFT ↔ WebUI/Civitai 형식)
 import torch
 from safetensors.torch import save_file, load_file
 import os
+from peft.utils.save_and_load import get_peft_model_state_dict
 
 
 def convert_peft_to_webui(peft_state_dict):
@@ -71,8 +72,8 @@ def save_lora_as_webui(unet_model, save_path, lora_alpha=64, lora_rank=32):
         lora_alpha: LoRA alpha 값 (스케일링)
         lora_rank: LoRA rank 값
     """
-    # LoRA 가중치만 추출
-    peft_state_dict = {k: v.cpu() for k, v in unet_model.state_dict().items() if 'lora' in k}
+    # LoRA 가중치만 추출 (PEFT 공식 헬퍼 함수 사용)
+    peft_state_dict = get_peft_model_state_dict(unet_model)
 
     # WebUI 형식으로 변환
     webui_state_dict = convert_peft_to_webui(peft_state_dict)
@@ -80,7 +81,8 @@ def save_lora_as_webui(unet_model, save_path, lora_alpha=64, lora_rank=32):
     # 메타데이터에 alpha 값 추가 (각 LoRA 레이어마다)
     # Civitai/WebUI 형식은 이런 식으로 alpha를 저장함
     metadata = {}
-    for key in webui_state_dict.keys():
+    # 딕셔너리 크기 변경 에러 방지: keys()를 리스트로 변환
+    for key in list(webui_state_dict.keys()):
         if '.lora_up.weight' in key or '.lora_down.weight' in key:
             # 레이어 이름 추출
             base_key = key.rsplit('.', 2)[0]  # ".lora_up.weight" 또는 ".lora_down.weight" 제거
@@ -98,3 +100,4 @@ def save_lora_as_webui(unet_model, save_path, lora_alpha=64, lora_rank=32):
     print(f"   File: {save_path}")
 
     return save_path
+
