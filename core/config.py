@@ -23,11 +23,11 @@ class TrainingConfig:
     target_modules: list = None  # ["to_q", "to_v", "to_k", "to_out.0"]
 
     # 학습
-    num_epochs: int = 250
-    learning_rate: float = 2e-5  # 학습률
+    num_epochs: int = 100
+    learning_rate: float = 1e-4  # 학습률
     weight_decay: float = 1e-2
     gradient_accumulation_steps: int = 1
-    batch_size: int = 2
+    batch_size: int = 6
     max_grad_norm: float = 1.0
 
     # Diffusion
@@ -67,7 +67,7 @@ class InferenceConfig:
     output_dir: str = "outputs"
 
     # Trigger word
-    trigger_word: str = "sks"
+    trigger_word: str = "None"
 
 
 @dataclass

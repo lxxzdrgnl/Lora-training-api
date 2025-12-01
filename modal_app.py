@@ -93,6 +93,7 @@ secrets = modal.Secret.from_name("lora-secrets")
     secrets=[secrets],
     memory=32768,  # 32GB RAM
     enable_memory_snapshot=True,  # 메모리 스냅샷 활성화 - 부팅 시간 획기적 단축!
+    concurrency_limit=10,  # 최대 10개 컨테이너만 동시 실행 (GPU 리소스 관리)
 )
 class LoraTrainer:
     """
@@ -114,6 +115,9 @@ class LoraTrainer:
 
         self.base_model_path = "stablediffusionapi/anything-v5"
 
+        # 현재 학습 중인 작업 정보 초기화
+        self.current_training = None
+
         print(f"📦 Loading base model from: {self.base_model_path}")
 
         # 파이프라인 로드 (메모리 스냅샷에 포함됨)
@@ -126,6 +130,42 @@ class LoraTrainer:
 
         print("✅ Base model loaded and ready!")
         print("💾 Memory snapshot will be created after this initialization")
+
+    @modal.exit()
+    def cleanup_on_exit(self):
+        """
+        컨테이너 종료 시 실행됩니다.
+        학습이 완료되지 않은 상태에서 종료될 경우 실패 메시지를 전송합니다.
+        """
+        import requests
+
+        # 학습 중인 작업이 있고, 완료되지 않았다면 실패 콜백 전송
+        if self.current_training is not None:
+            callback_url = self.current_training.get("callback_url")
+            user_id = self.current_training.get("user_id")
+            model_id = self.current_training.get("model_id")
+            job_id = self.current_training.get("job_id")
+            model_name = self.current_training.get("model_name")
+
+            if callback_url:
+                try:
+                    print(f"⚠️ Container shutting down during training for job {job_id}")
+                    print(f"📤 Sending failure callback...")
+
+                    callback_data = {
+                        "userId": user_id,
+                        "modelId": model_id,
+                        "jobId": job_id,
+                        "modelName": model_name,
+                        "status": "FAIL",
+                        "error": "Training interrupted: Container was shut down or cancelled",
+                        "traceback": "Container exit during training (possible timeout, manual cancellation, or server shutdown)"
+                    }
+                    response = requests.post(callback_url, json=callback_data, timeout=10)
+                    response.raise_for_status()
+                    print(f"✅ Failure callback sent for interrupted job {job_id}")
+                except Exception as e:
+                    print(f"⚠️ Failed to send failure callback on exit: {e}")
 
     @modal.method()
     def train_lora(
@@ -169,6 +209,15 @@ class LoraTrainer:
         import shutil
         import boto3
         import time
+
+        # 현재 학습 중인 작업 정보 저장 (컨테이너 종료 시 실패 콜백 전송용)
+        self.current_training = {
+            "user_id": user_id,
+            "model_id": model_id,
+            "job_id": job_id,
+            "model_name": model_name,
+            "callback_url": callback_url
+        }
 
         print(f"Starting training for job: {job_id}, model: {model_name}")
         print(f"Number of training images: {len(training_image_urls)}")
@@ -323,6 +372,9 @@ class LoraTrainer:
             training_folder = f"{CACHE_DIR}/training-{job_id}"
             shutil.rmtree(training_folder, ignore_errors=True)
 
+            # 학습 완료 - current_training 초기화 (컨테이너 종료 시 중복 실패 콜백 방지)
+            self.current_training = None
+
             return {
                 "status": "SUCCESS",
                 "s3_model_key": s3_model_key,
@@ -358,6 +410,9 @@ class LoraTrainer:
             training_folder = f"{CACHE_DIR}/training-{job_id}"
             shutil.rmtree(training_folder, ignore_errors=True)
 
+            # 학습 실패 - current_training 초기화 (컨테이너 종료 시 중복 실패 콜백 방지)
+            self.current_training = None
+
             raise
 
 
@@ -373,6 +428,7 @@ class LoraTrainer:
     memory=16384,  # 16GB RAM
     enable_memory_snapshot=True,  # 메모리 스냅샷 활성화 - 부팅 시간 획기적 단축!
     scaledown_window=2,  # 2초 후 종료 (최소 설정값)
+    concurrency_limit=10,  # 최대 10개 컨테이너만 동시 실행 (GPU 리소스 관리)
 )
 class ImageGenerator:
     """
@@ -391,6 +447,9 @@ class ImageGenerator:
         """
         from diffusers import StableDiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
         import torch
+
+        # 현재 생성 중인 작업 정보 초기화
+        self.current_generation = None
 
         print("🚀 Initializing Image Generator...")
 
@@ -413,6 +472,39 @@ class ImageGenerator:
 
         print("✅ Base model loaded with original VAE and scheduler!")
         print("💾 Memory snapshot will be created after this initialization")
+
+    @modal.exit()
+    def cleanup_on_exit(self):
+        """
+        컨테이너 종료 시 실행됩니다.
+        이미지 생성이 완료되지 않은 상태에서 종료될 경우 실패 메시지를 전송합니다.
+        """
+        import requests
+
+        # 생성 중인 작업이 있고, 완료되지 않았다면 실패 콜백 전송
+        if self.current_generation is not None:
+            callback_url = self.current_generation.get("callback_url")
+            user_id = self.current_generation.get("user_id")
+            model_id = self.current_generation.get("model_id")
+            history_id = self.current_generation.get("history_id")
+
+            if callback_url:
+                try:
+                    print(f"⚠️ Container shutting down during generation for history {history_id}")
+                    print(f"📤 Sending failure callback...")
+
+                    callback_data = {
+                        "historyId": history_id,
+                        "userId": user_id,
+                        "modelId": model_id,
+                        "status": "FAIL",
+                        "error": "Generation interrupted: Container was shut down or cancelled"
+                    }
+                    response = requests.post(callback_url, json=callback_data, timeout=10)
+                    response.raise_for_status()
+                    print(f"✅ Failure callback sent for interrupted generation {history_id}")
+                except Exception as e:
+                    print(f"⚠️ Failed to send failure callback on exit: {e}")
 
     @modal.method()
     def generate_images(
@@ -458,6 +550,14 @@ class ImageGenerator:
         import requests
         import boto3
         import shutil
+
+        # 현재 생성 중인 작업 정보 저장 (컨테이너 종료 시 실패 콜백 전송용)
+        self.current_generation = {
+            "user_id": user_id,
+            "model_id": model_id,
+            "history_id": history_id,
+            "callback_url": callback_url
+        }
 
         print(f"Generating images for user: {user_id}")
         print(f"Prompt: {prompt}")
@@ -642,6 +742,9 @@ class ImageGenerator:
             # 임시 파일 정리 (LoRA 모델은 캐시로 유지)
             shutil.rmtree(output_dir, ignore_errors=True)
 
+            # 생성 완료 - current_generation 초기화 (컨테이너 종료 시 중복 실패 콜백 방지)
+            self.current_generation = None
+
             return s3_keys
 
         except Exception as e:
@@ -667,6 +770,9 @@ class ImageGenerator:
                 del generation_progress[history_id]
 
             shutil.rmtree(output_dir, ignore_errors=True)
+
+            # 생성 실패 - current_generation 초기화 (컨테이너 종료 시 중복 실패 콜백 방지)
+            self.current_generation = None
 
             raise
 
