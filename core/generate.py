@@ -13,6 +13,35 @@ from pathlib import Path
 from .config import InferenceConfig
 
 
+# 파이프라인 캐시 클래스 (싱글톤 패턴)
+class PipelineCache:
+    """파이프라인을 메모리에 캐싱하여 재사용"""
+    _instance = None
+    _pipelines = {}  # {(model_id, lora_path): pipeline}
+
+    @classmethod
+    def get_pipeline(cls, model_id: str, lora_path: str, device: str):
+        """캐시된 파이프라인 반환 또는 새로 로드"""
+        cache_key = (model_id, lora_path)
+
+        if cache_key in cls._pipelines:
+            print(f"🚀 Using cached pipeline (model: {model_id}, lora: {lora_path})")
+            return cls._pipelines[cache_key]
+
+        print(f"📦 Loading new pipeline into cache...")
+        pipe = load_pipeline(model_id, lora_path, device)
+        cls._pipelines[cache_key] = pipe
+        return pipe
+
+    @classmethod
+    def clear_cache(cls):
+        """캐시 초기화 (메모리 정리용)"""
+        cls._pipelines.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("🧹 Pipeline cache cleared")
+
+
 def load_pipeline(model_id: str, lora_path: str, device: str):
     """
     Stable Diffusion 파이프라인 + LoRA 로드
@@ -103,6 +132,21 @@ def load_pipeline(model_id: str, lora_path: str, device: str):
     # GPU로 이동
     pipe.to(device)
 
+    # xFormers 최적화 활성화
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+        print("✅ xFormers memory efficient attention enabled")
+    except Exception as e:
+        print(f"⚠️ xFormers not available: {e}")
+        print("   Falling back to default attention (still works, just slower)")
+
+    # Attention slicing 활성화 (메모리 효율성)
+    try:
+        pipe.enable_attention_slicing(slice_size="auto")
+        print("✅ Attention slicing enabled")
+    except Exception as e:
+        print(f"⚠️ Could not enable attention slicing: {e}")
+
     print("✅ LoRA loaded successfully in WebUI/Civitai format!\n")
     return pipe
 
@@ -158,8 +202,8 @@ def generate_images(
     if output_dir is not None:
         config.output_dir = output_dir
 
-    # 파이프라인 로드
-    pipe = load_pipeline(config.model_id, config.lora_path, config.device)
+    # 파이프라인 로드 (캐시 사용)
+    pipe = PipelineCache.get_pipeline(config.model_id, config.lora_path, config.device)
 
     # Trigger word 자동 추가 (사용자 요청으로 제거됨)
     # if not config.prompt.startswith(config.trigger_word):

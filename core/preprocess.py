@@ -26,21 +26,53 @@ class ImagePreprocessor:
         self.enable_captioning = enable_captioning
         self.trigger_word = trigger_word
 
-        # OCR 초기화
+        # OCR 초기화 (Modal Volume 캐싱)
         print("Initializing OCR...")
+
+        # Modal Volume 캐시 경로 지정
+        import os
+        cache_dir = "/cache/easyocr_model"
+        os.makedirs(cache_dir, exist_ok=True)
+
         self.reader = easyocr.Reader(
             ['ko', 'en'],
-            gpu=torch.cuda.is_available()
+            gpu=torch.cuda.is_available(),
+            model_storage_directory=cache_dir,  # 캐시 디렉토리 지정
+            download_enabled=True  # 캐시 없으면 다운로드
         )
+        print("✅ EasyOCR initialized (models cached)")
 
-        # BLIP 캡셔닝 모델 초기화
+        # BLIP 캡셔닝 모델 초기화 (Modal Volume 캐싱)
         if self.enable_captioning:
             print("Initializing BLIP captioning model...")
-            self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-            self.caption_model = BlipForConditionalGeneration.from_pretrained(
-                "Salesforce/blip-image-captioning-base",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
+
+            # Modal Volume 캐시 경로
+            cache_dir = "/cache/blip_model"
+
+            # 캐시된 모델이 있는지 확인
+            import os
+            if os.path.exists(cache_dir) and os.path.exists(os.path.join(cache_dir, "config.json")):
+                print(f"✅ Using cached BLIP model from: {cache_dir}")
+                self.caption_processor = BlipProcessor.from_pretrained(cache_dir)
+                self.caption_model = BlipForConditionalGeneration.from_pretrained(
+                    cache_dir,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                )
+            else:
+                # 캐시가 없으면 다운로드 후 캐싱
+                print(f"📥 Downloading BLIP model (first time only)...")
+                self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+                self.caption_model = BlipForConditionalGeneration.from_pretrained(
+                    "Salesforce/blip-image-captioning-base",
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                )
+
+                # Modal Volume에 저장
+                os.makedirs(cache_dir, exist_ok=True)
+                self.caption_processor.save_pretrained(cache_dir)
+                self.caption_model.save_pretrained(cache_dir)
+                print(f"✅ BLIP model cached to: {cache_dir}")
+
             if torch.cuda.is_available():
                 self.caption_model.to("cuda")
             self.caption_model.eval()
@@ -325,13 +357,36 @@ def caption_only_dataset(
 
     print(f"Found {len(image_files)} images for captioning")
 
-    # BLIP 캡셔닝 모델 초기화
+    # BLIP 캡셔닝 모델 초기화 (Modal Volume 캐싱)
     print("Initializing BLIP captioning model...")
-    caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    caption_model = BlipForConditionalGeneration.from_pretrained(
-        "Salesforce/blip-image-captioning-base",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-    )
+
+    # Modal Volume 캐시 경로
+    import os
+    cache_dir = "/cache/blip_model"
+
+    # 캐시된 모델이 있는지 확인
+    if os.path.exists(cache_dir) and os.path.exists(os.path.join(cache_dir, "config.json")):
+        print(f"✅ Using cached BLIP model from: {cache_dir}")
+        caption_processor = BlipProcessor.from_pretrained(cache_dir)
+        caption_model = BlipForConditionalGeneration.from_pretrained(
+            cache_dir,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
+    else:
+        # 캐시가 없으면 다운로드 후 캐싱
+        print(f"📥 Downloading BLIP model (first time only)...")
+        caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        caption_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base",
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
+
+        # Modal Volume에 저장
+        os.makedirs(cache_dir, exist_ok=True)
+        caption_processor.save_pretrained(cache_dir)
+        caption_model.save_pretrained(cache_dir)
+        print(f"✅ BLIP model cached to: {cache_dir}")
+
     if torch.cuda.is_available():
         caption_model.to("cuda")
     caption_model.eval()

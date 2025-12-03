@@ -10,7 +10,7 @@ from pathlib import Path
 # Modal 앱 생성
 app = modal.App("lora-training-inference")
 
-# 베이스 이미지 빌드 함수 (베이스 모델 포함)
+# 베이스 이미지 빌드 함수 (베이스 모델 + rembg 모델 포함)
 def download_base_model_to_image():
     """
     이미지 빌드 시 베이스 모델을 다운로드하여 이미지에 포함시킵니다.
@@ -37,6 +37,26 @@ def download_base_model_to_image():
     print(f"✅ Base model cached to: {cache_dir}")
 
 
+def download_rembg_model_to_image():
+    """
+    rembg의 u2net 모델(176MB)을 이미지에 미리 다운로드
+    매 학습마다 다운받지 않도록 최적화
+    """
+    from rembg import new_session
+    import os
+
+    # u2net 모델 다운로드 (rembg가 자동으로 ~/.u2net에 저장)
+    print("📥 Downloading rembg u2net model (176MB)...")
+
+    # HOME 환경변수 설정 (Modal 환경)
+    os.environ["HOME"] = "/root"
+
+    # u2net 세션 생성 (첫 생성 시 자동 다운로드)
+    session = new_session("u2net")
+
+    print("✅ Rembg u2net model cached to /root/.u2net/")
+
+
 # 베이스 이미지 (라이브러리 + 베이스 모델 포함 - 캐싱 최적화)
 # 패키지와 베이스 모델은 거의 변경되지 않으므로 한 번 빌드되면 계속 재사용됨
 base_image = (
@@ -52,6 +72,7 @@ base_image = (
         "peft>=0.7.0",
         "safetensors>=0.4.0",
         "bitsandbytes>=0.41.0",
+        "xformers>=0.0.22",  # xFormers 최적화 추가
         "Pillow>=10.0.0",
         "opencv-python>=4.8.0",
         "rembg>=2.0.0",
@@ -67,6 +88,8 @@ base_image = (
     )
     # 베이스 모델을 이미지에 포함 (첫 빌드 시 시간 걸리지만 이후 매우 빠름)
     .run_function(download_base_model_to_image)
+    # rembg u2net 모델 포함 (176MB, 매 학습마다 다운받지 않도록)
+    .run_function(download_rembg_model_to_image)
 )
 
 # 최종 이미지 (core 디렉토리 추가 - 자주 변경되는 파일)
@@ -82,10 +105,10 @@ CACHE_DIR = "/cache"
 # AWS Secrets 설정
 secrets = modal.Secret.from_name("lora-secrets")
 
-# LoRA 학습 클래스 (GPU A10G 사용)
+# LoRA 학습 클래스 (GPU T4 사용)
 @app.cls(
     image=image,
-    gpu="A10G",  # 학습용 GPU
+    gpu="T4",  # 학습용 GPU
     timeout=7200,  # 2시간
     volumes={
         CACHE_DIR: modal.Volume.from_name("lora-cache", create_if_missing=True)
@@ -357,6 +380,7 @@ class LoraTrainer:
                     callback_data = {
                         "userId": user_id,
                         "modelId": model_id,
+                        "jobId": job_id,
                         "modelName": model_name,
                         "s3ModelKey": s3_model_key,
                         "fileSize": file_size,
@@ -442,36 +466,140 @@ class ImageGenerator:
     @modal.enter()
     def load_models(self):
         """
-        컨테이너 시작 시 베이스 모델을 메모리에 로드합니다.
-        메모리 스냅샷이 활성화되어 있어 이 초기화는 한 번만 수행됩니다.
+        컨테이너 시작 시 초기화합니다.
+        베이스 모델은 요청 시 동적으로 로드하여 캐싱합니다.
         """
-        from diffusers import StableDiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler
         import torch
 
         # 현재 생성 중인 작업 정보 초기화
         self.current_generation = None
 
-        print("🚀 Initializing Image Generator...")
+        # 파이프라인 캐시 (base_model_id -> pipeline)
+        self.pipelines = {}
 
-        # 베이스 모델 경로
-        self.base_model_path = "/base_models/anything-v5"
+        # 외부 VAE 캐시
+        self.external_vae = None
 
-        if not os.path.exists(self.base_model_path):
-            print("⚠️ Base model not found in image, using HuggingFace")
-            self.base_model_path = "stablediffusionapi/anything-v5"
+        print("🚀 Image Generator initialized (pipelines will be loaded on-demand)")
 
-        print(f"📦 Loading base model from: {self.base_model_path}")
+    def get_or_load_pipeline(self, base_model: str):
+        """
+        베이스 모델에 따라 파이프라인을 캐시에서 가져오거나 새로 로드합니다.
 
-        # 파이프라인 로드 (원본 VAE 사용 - 로컬 학습 모델 호환성)
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            self.base_model_path,
+        Args:
+            base_model: 베이스 모델 ID
+
+        Returns:
+            StableDiffusionPipeline: 로드된 파이프라인
+        """
+        from diffusers import StableDiffusionPipeline
+        import torch
+
+        # 이미 로드된 파이프라인이 있으면 재사용
+        if base_model in self.pipelines:
+            print(f"🚀 Using cached pipeline for: {base_model}")
+            return self.pipelines[base_model]
+
+        # 새로 로드
+        print(f"📦 Loading new base model: {base_model}")
+
+        # Modal Volume 캐싱 로직
+        cache_base = "/cache/base_models"
+        safe_model_id = base_model.replace("/", "--")
+        cached_model_path = os.path.join(cache_base, safe_model_id)
+
+        # 캐시된 모델 확인
+        if os.path.exists(cached_model_path) and os.path.exists(os.path.join(cached_model_path, "model_index.json")):
+            base_model_path = cached_model_path
+            print(f"✅ Using cached base model from volume: {base_model_path}")
+        else:
+            # 캐시가 없으면 HuggingFace에서 다운로드 후 캐싱
+            print(f"📥 Downloading base model from HuggingFace: {base_model}")
+            print(f"💾 Will cache to: {cached_model_path}")
+
+            temp_pipe = StableDiffusionPipeline.from_pretrained(
+                base_model,
+                torch_dtype=torch.float16,
+                safety_checker=None
+            )
+
+            os.makedirs(cache_base, exist_ok=True)
+            temp_pipe.save_pretrained(cached_model_path)
+            print(f"✅ Base model cached successfully!")
+
+            base_model_path = cached_model_path
+
+        print(f"Loading base model: {base_model_path}")
+        pipe = StableDiffusionPipeline.from_pretrained(
+            base_model_path,
             torch_dtype=torch.float16,
             safety_checker=None
         )
-        self.pipe.to("cuda")
+        pipe.to("cuda")
 
-        print("✅ Base model loaded with original VAE and scheduler!")
-        print("💾 Memory snapshot will be created after this initialization")
+        # xFormers 최적화 활성화
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("✅ xFormers memory efficient attention enabled")
+        except Exception as e:
+            print(f"⚠️ xFormers not available: {e}")
+
+        # Attention slicing 활성화
+        try:
+            pipe.enable_attention_slicing(slice_size="auto")
+            print("✅ Attention slicing enabled")
+        except Exception as e:
+            print(f"⚠️ Could not enable attention slicing: {e}")
+
+        # 캐시에 저장
+        self.pipelines[base_model] = pipe
+        print(f"✅ Pipeline cached for: {base_model}")
+
+        return pipe
+
+    def get_or_load_external_vae(self):
+        """
+        외부 VAE를 캐싱해서 재사용합니다.
+
+        Returns:
+            AutoencoderKL: 외부 VAE 모델
+        """
+        from diffusers import AutoencoderKL
+        import torch
+
+        # 이미 메모리에 로드되어 있으면 재사용
+        if self.external_vae is not None:
+            print("🚀 Using cached external VAE (in-memory)")
+            return self.external_vae
+
+        # Modal Volume 캐시 경로
+        cache_dir = "/cache/vae_model"
+
+        # Volume에 캐시되어 있는지 확인
+        if os.path.exists(cache_dir) and os.path.exists(os.path.join(cache_dir, "config.json")):
+            print(f"✅ Loading external VAE from volume cache: {cache_dir}")
+            vae = AutoencoderKL.from_pretrained(
+                cache_dir,
+                torch_dtype=torch.float16
+            ).to("cuda")
+        else:
+            # 캐시가 없으면 다운로드 후 저장
+            print(f"📥 Downloading external VAE (first time only)...")
+            vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sd-vae-ft-mse",
+                torch_dtype=torch.float16
+            ).to("cuda")
+
+            # Modal Volume에 저장
+            os.makedirs(cache_dir, exist_ok=True)
+            vae.save_pretrained(cache_dir)
+            print(f"✅ External VAE cached to: {cache_dir}")
+
+        # 메모리에 캐시
+        self.external_vae = vae
+        print("✅ External VAE loaded and cached in memory")
+
+        return vae
 
     @modal.exit()
     def cleanup_on_exit(self):
@@ -665,6 +793,9 @@ class ImageGenerator:
                 except Exception as e:
                     print(f"⚠️ Failed to send progress: {e}")
 
+        # 베이스 모델에 따라 파이프라인 가져오기 (동적 캐싱)
+        pipe = self.get_or_load_pipeline(base_model)
+
         # Reze 모델 특별 처리 (0/Reze.safetensors)
         is_reze_model = "0/Reze.safetensors" in lora_model_url
         print(f"🔍 Model: {'Reze (원본 VAE)' if is_reze_model else '일반 모델 (외부 VAE)'}")
@@ -674,24 +805,117 @@ class ImageGenerator:
             # Reze 모델: 원본 VAE 유지
             print("✅ Using original VAE for Reze model")
         else:
-            # 나머지 모델: 외부 VAE 사용
-            print("🔧 Loading external VAE...")
-            from diffusers import AutoencoderKL
-            import torch
-            vae = AutoencoderKL.from_pretrained(
-                "stabilityai/sd-vae-ft-mse",
-                torch_dtype=torch.float16
-            ).to("cuda")
-            self.pipe.vae = vae
-            print("✅ External VAE loaded")
+            # 나머지 모델: 외부 VAE 사용 (캐싱됨)
+            vae = self.get_or_load_external_vae()
+            pipe.vae = vae
 
-        # 이미지 생성
+        # 파이프라인에 LoRA 로드
+        print(f"Loading LoRA weights: {temp_lora_path}")
+
+        # 기존 LoRA 언로드 (있다면)
         try:
-            generated_files = generate_images(
-                lora_path=temp_lora_path,
-                config=config,
-                callback=progress_callback
-            )
+            pipe.unload_lora_weights()
+        except:
+            pass
+
+        # LoRA 로드
+        safetensors_files = [f for f in os.listdir(temp_lora_path) if f.endswith('.safetensors')]
+        lora_file = safetensors_files[0]
+        print(f"Found LoRA file: {lora_file}")
+        pipe.load_lora_weights(
+            temp_lora_path,
+            weight_name=lora_file
+        )
+        print("✅ LoRA loaded successfully!")
+
+        # 이미지 생성 (사전 로드된 파이프라인 사용)
+        try:
+            from datetime import datetime
+            from pathlib import Path
+            import torch
+
+            full_prompt = prompt
+            print("="*60)
+            print(f"Generating {num_images} image(s)")
+            print(f"Prompt: {full_prompt}")
+            print(f"Negative: {negative_prompt}")
+            print(f"Steps: {steps} | CFG Scale: {guidance_scale}")
+            if seed is not None:
+                print(f"Seed: {seed}")
+            print("="*60)
+
+            # 시드 설정
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device="cuda").manual_seed(seed)
+
+            # 이미지 생성
+            generated_files = []
+
+            # 생성 시작 콜백
+            if progress_callback:
+                progress_callback(
+                    status="GENERATING",
+                    current_image=0,
+                    total_images=num_images,
+                    current_step=0,
+                    total_steps=steps,
+                    message=f"이미지 생성 시작... (0/{num_images})"
+                )
+
+            for i in range(num_images):
+                print(f"\n[{i+1}/{num_images}] Generating...")
+
+                # Step별 콜백 함수 정의
+                def step_callback(pipe_instance, step_index, timestep, callback_kwargs):
+                    if progress_callback:
+                        progress_callback(
+                            status="GENERATING",
+                            current_image=i + 1,
+                            total_images=num_images,
+                            current_step=step_index + 1,
+                            total_steps=steps,
+                            message=f"이미지 {i+1}/{num_images} 생성 중... (step {step_index+1}/{steps})"
+                        )
+                    return callback_kwargs
+
+                with torch.no_grad():
+                    image = pipe(
+                        prompt=full_prompt,
+                        negative_prompt=negative_prompt,
+                        num_inference_steps=steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        callback_on_step_end=step_callback,
+                        callback_on_step_end_tensor_inputs=["latents"],
+                        cross_attention_kwargs={"scale": lora_scale}
+                    ).images[0]
+
+                # 파일명 생성
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{timestamp}_{i+1}.png"
+                output_path = Path(output_dir) / filename
+
+                # 저장
+                image.save(output_path)
+                generated_files.append(str(output_path))
+                print(f"✅ Saved: {output_path}")
+
+                # 이미지 완료 콜백
+                if progress_callback:
+                    progress_callback(
+                        status="GENERATING",
+                        current_image=i + 1,
+                        total_images=num_images,
+                        current_step=steps,
+                        total_steps=steps,
+                        message=f"이미지 {i+1}/{num_images} 완료"
+                    )
+
+            print("\n" + "="*60)
+            print(f"✅ Successfully generated {len(generated_files)} image(s)")
+            print(f"📁 Output folder: {output_dir}")
+            print("="*60)
 
             # S3 업로드
             print("Uploading generated images to S3...")
@@ -875,7 +1099,7 @@ def fastapi_app():
                 skip_preprocessing=req.skip_preprocessing
             )
 
-            return {"message": f"Training started on Modal GPU (A10G) for job {req.job_id}"}
+            return {"message": f"Training started on Modal GPU (T4) for job {req.job_id}"}
 
         except Exception as e:
             return JSONResponse(
